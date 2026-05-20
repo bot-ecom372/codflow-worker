@@ -73,6 +73,7 @@ class UploadRequest(BaseModel):
     secret: str
     credentials: Credentials
     orders: list[Order]
+    force: bool = False  # Skip duplicate pre-check (for manual uploads)
 
 
 class TrackingRequest(BaseModel):
@@ -409,18 +410,24 @@ def upload_orders(req: UploadRequest):
             _invalidate_session(req.credentials)
             raise Exception(f"Login failed: {e}")
 
-        # Pre-check anti-duplicates (Criticità #4)
-        existing_ids = _get_existing_order_ids(session, req.credentials.base_url)
-        new_orders = [o for o in valid_orders if o.order_id.lstrip("#") not in existing_ids]
-        skipped = len(valid_orders) - len(new_orders)
-        already_on_spedisci = [o.order_id for o in valid_orders if o.order_id.lstrip("#") in existing_ids]
+        # Pre-check anti-duplicates (Criticità #4) — skip if force=True
+        already_on_spedisci = []
+        if req.force:
+            # Force upload: skip pre-check entirely
+            new_orders = valid_orders
+            skipped = 0
+        else:
+            existing_ids = _get_existing_order_ids(session, req.credentials.base_url)
+            new_orders = [o for o in valid_orders if o.order_id.lstrip("#") not in existing_ids]
+            skipped = len(valid_orders) - len(new_orders)
+            already_on_spedisci = [o.order_id for o in valid_orders if o.order_id.lstrip("#") in existing_ids]
 
-        if not new_orders:
-            return {
-                "success": True, "uploaded": 0, "skipped": skipped,
-                "already_on_spedisci": already_on_spedisci,
-                "message": "All orders already on Spedisci"
-            }
+            if not new_orders:
+                return {
+                    "success": True, "uploaded": 0, "skipped": skipped,
+                    "already_on_spedisci": already_on_spedisci,
+                    "message": "All orders already on Spedisci"
+                }
 
         # Generate CSV
         csv_content = _generate_csv(new_orders, req.credentials.sender_name)
