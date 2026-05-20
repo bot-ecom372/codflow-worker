@@ -1,13 +1,27 @@
 """
 CodFlow Worker — Spedisci Online integration
-Handles: login (CSRF + 2FA TOTP), CSV upload, tracking fetch
+Handles: login (CSRF + 2FA TOTP), CSV upload, tracking fetch, reconciliation
+
+Criticità risolte:
+- #2: CSRF doppio (_token + X-XSRF-TOKEN, prende SEMPRE ultimo cookie)
+- #3: Ghost orders (marca caricato SOLO dopo "importato con successo")
+- #4: Duplicati (single-flight + pre-check + reconciliation endpoint)
+- #5: 2 endpoint (ordersData per check, shippingsdata per tracking)
+- #6: HTML nel tracking (regex extraction)
+- #7: Email destinatario sempre vuoto
+- #8: TOTP timing (3 retry con sleep 5s)
+- #9: Campo "image" per upload CSV
+- #10: Sessione scaduta (verifica + invalidazione su errore)
+- #11: Importo zero (filtro amount > 0)
+- #12: Job bloccato (try/except per singola spedizione)
+- #13: Matching multiplo (order_id, order_number, original_order_id, reference)
+- #14: Prodotto in note
 """
 
 import os
 import re
 import csv
 import io
-import json
 import time
 import threading
 from typing import Optional
@@ -18,12 +32,12 @@ import requests
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 
-app = FastAPI(title="CodFlow Worker", version="1.0.0")
+app = FastAPI(title="CodFlow Worker", version="1.1.0")
 
 # Single-flight lock
 _upload_lock = threading.Lock()
 
-# Session cache (in-memory, per base_url)
+# Session cache (in-memory, per base_url:email)
 _sessions: dict[str, requests.Session] = {}
 
 WORKER_SECRET = os.getenv("WORKER_SECRET", "codflow-worker-2026")
@@ -72,6 +86,12 @@ class TestRequest(BaseModel):
     credentials: Credentials
 
 
+class ReconcileRequest(BaseModel):
+    secret: str
+    credentials: Credentials
+    order_ids: list[str]  # IDs that are "caricato" in our DB
+
+
 # ═══════════════════════════════════════════
 # AUTH
 # ═══════════════════════════════════════════
@@ -82,9 +102,15 @@ def _extract_csrf(html: str) -> Optional[str]:
     return m.group(1) if m else None
 
 
-def _login(creds: Credentials, session: Optional[requests.Session] = None) -> requests.Session:
+def _get_xsrf_token(session: requests.Session) -> str:
+    """Get the LAST XSRF-TOKEN cookie value (Criticità #2: multiple cookies)."""
+    values = [unquote(c.value) for c in session.cookies if c.name == "XSRF-TOKEN"]
+    return values[-1] if values else ""
+
+
+def _login(creds: Credentials) -> requests.Session:
     """Login to Spedisci: CSRF → credentials → 2FA TOTP."""
-    s = session or requests.Session()
+    s = requests.Session()
     base = creds.base_url.rstrip("/")
 
     # Step 1: GET login page → CSRF token
@@ -105,12 +131,11 @@ def _login(creds: Credentials, session: Optional[requests.Session] = None) -> re
     # Check if we landed on 2FA page
     csrf_2fa = _extract_csrf(r.text)
     if not csrf_2fa:
-        # Maybe already logged in or wrong creds
         if "/home" in r.url:
             return s
         raise Exception("Login failed — no 2FA page found. Check credentials.")
 
-    # Step 3: POST 2FA with TOTP (retry up to 3 times)
+    # Step 3: POST 2FA with TOTP (retry up to 3 times — Criticità #8)
     totp = pyotp.TOTP(creds.totp_secret)
     for attempt in range(3):
         otp_code = totp.now()
@@ -129,7 +154,7 @@ def _login(creds: Credentials, session: Optional[requests.Session] = None) -> re
 
 
 def _get_session(creds: Credentials) -> requests.Session:
-    """Get or create an authenticated session."""
+    """Get or create an authenticated session (Criticità #10: session invalidation)."""
     key = f"{creds.base_url}:{creds.email}"
 
     # Try existing session
@@ -141,11 +166,19 @@ def _get_session(creds: Credentials) -> requests.Session:
                 return s
         except:
             pass
+        # Session invalid — remove it
+        del _sessions[key]
 
     # Fresh login
     s = _login(creds)
     _sessions[key] = s
     return s
+
+
+def _invalidate_session(creds: Credentials):
+    """Force invalidate a cached session (Criticità #10)."""
+    key = f"{creds.base_url}:{creds.email}"
+    _sessions.pop(key, None)
 
 
 def _verify_secret(secret: str):
@@ -188,9 +221,9 @@ def _generate_csv(orders: list[Order], sender_name: str) -> str:
             f"{o.amount:.2f}",                  # contrassegno
             sender_name,                        # rif_mittente
             o.customer_name,                    # rif_destinatario
-            (o.product_name or "")[:50],        # note
+            (o.product_name or "")[:50],        # note (Criticità #14)
             phone,                              # telefono
-            "",                                 # email_destinatario (ALWAYS EMPTY)
+            "",                                 # email_destinatario (ALWAYS EMPTY — Criticità #7)
             (o.product_name or "Prodotto")[:50],# contenuto
             o.order_id,                         # order_id
             f"{o.amount:.2f}",                  # totale_ordine
@@ -204,7 +237,7 @@ def _generate_csv(orders: list[Order], sender_name: str) -> str:
 # ═══════════════════════════════════════════
 
 def _get_existing_order_ids(session: requests.Session, base_url: str, days_back: int = 14) -> set[str]:
-    """Get order IDs already on Spedisci."""
+    """Get order IDs already on Spedisci (uses ordersData — Criticità #5)."""
     from datetime import datetime, timedelta
     base = base_url.rstrip("/")
     now = datetime.now()
@@ -213,7 +246,7 @@ def _get_existing_order_ids(session: requests.Session, base_url: str, days_back:
 
     try:
         r = session.get(f"{base}/orders/ordersData", params={
-            "draw": 1, "start": 0, "length": 2000,
+            "draw": 1, "start": 0, "length": 5000,
             "dalla_data": from_date, "alla_data": to_date,
         }, headers={
             "X-Requested-With": "XMLHttpRequest",
@@ -223,9 +256,11 @@ def _get_existing_order_ids(session: requests.Session, base_url: str, days_back:
         data = r.json().get("data", [])
         ids = set()
         for item in data:
-            oid = str(item.get("order_id") or item.get("order_number") or "")
-            if oid:
-                ids.add(oid)
+            # Check multiple fields (Criticità #13)
+            for field in ["order_id", "order_number", "original_order_id", "reference"]:
+                val = str(item.get(field) or "").strip().lstrip("#")
+                if val:
+                    ids.add(val)
         return ids
     except Exception as e:
         print(f"[Pre-check] Error fetching existing orders: {e}")
@@ -245,26 +280,28 @@ def _upload_csv(session: requests.Session, base_url: str, csv_content: str) -> d
     r.raise_for_status()
     csrf = _extract_csrf(r.text)
     if not csrf:
-        raise Exception("CSRF token not found on import page")
+        raise Exception("CSRF token not found on import page — session may be expired")
 
-    # Get XSRF token from cookies
-    xsrf = ""
-    for cookie in session.cookies:
-        if cookie.name == "XSRF-TOKEN":
-            xsrf = unquote(cookie.value)
+    # Get XSRF token (Criticità #2: always get LAST cookie)
+    xsrf = _get_xsrf_token(session)
 
-    # Step 2: Upload
+    # Step 2: Upload (Criticità #9: field name is "image")
     csv_bytes = csv_content.encode("utf-8")
+    headers = {}
+    if xsrf:
+        headers["X-XSRF-TOKEN"] = xsrf
+
     r = session.post(f"{base}/imports/upload",
         data={"_token": csrf, "save_in_address_book": "0"},
         files={"image": ("orders.csv", csv_bytes, "text/csv")},
-        headers={"X-XSRF-TOKEN": xsrf} if xsrf else {},
+        headers=headers,
         timeout=30,
     )
     r.raise_for_status()
 
+    # Criticità #3: only mark success if Spedisci confirms
     success = "importato con successo" in r.text.lower()
-    return {"success": success, "status_code": r.status_code}
+    return {"success": success, "status_code": r.status_code, "response_snippet": r.text[:200]}
 
 
 # ═══════════════════════════════════════════
@@ -272,7 +309,7 @@ def _upload_csv(session: requests.Session, base_url: str, csv_content: str) -> d
 # ═══════════════════════════════════════════
 
 def _fetch_tracking(session: requests.Session, base_url: str, days_back: int = 14) -> list[dict]:
-    """Fetch shipping/tracking data from Spedisci."""
+    """Fetch shipping/tracking data from Spedisci (uses shippingsdata — Criticità #5)."""
     from datetime import datetime, timedelta
     base = base_url.rstrip("/")
     now = datetime.now()
@@ -280,7 +317,7 @@ def _fetch_tracking(session: requests.Session, base_url: str, days_back: int = 1
     to_date = now.strftime("%d/%m/%Y 11:59 pm")
 
     r = session.get(f"{base}/shippingsdata", params={
-        "draw": 1, "start": 0, "length": 2000,
+        "draw": 1, "start": 0, "length": 5000,
         "dalla_data": from_date, "alla_data": to_date,
     }, headers={
         "X-Requested-With": "XMLHttpRequest",
@@ -291,25 +328,39 @@ def _fetch_tracking(session: requests.Session, base_url: str, days_back: int = 1
     data = r.json().get("data", [])
     results = []
     for item in data:
-        order_id = str(item.get("order_id") or item.get("order_number") or "")
-        ldv_raw = str(item.get("ldv") or "")
+        # Criticità #12: try/except per singola spedizione
+        try:
+            # Criticità #13: check multiple ID fields
+            order_id = ""
+            for field in ["order_id", "order_number", "original_order_id", "reference"]:
+                val = str(item.get(field) or "").strip().lstrip("#")
+                if val:
+                    order_id = val
+                    break
 
-        # Extract tracking from HTML if wrapped in <a> tag
-        tracking = ldv_raw
-        m = re.search(r">([^<]+)<", ldv_raw)
-        if m:
-            tracking = m.group(1).strip()
+            ldv_raw = str(item.get("ldv") or "")
 
-        vector_id = item.get("vector_id")
-        carrier = "GLS" if vector_id == 2 else "Poste Delivery" if vector_id == 17 else f"Carrier_{vector_id}"
+            # Criticità #6: Extract tracking from HTML
+            tracking = ldv_raw
+            m = re.search(r">([^<]+)<", ldv_raw)
+            if m:
+                tracking = m.group(1).strip()
+            else:
+                tracking = re.sub(r"<[^>]+>", "", ldv_raw).strip()
 
-        if order_id and tracking:
-            results.append({
-                "order_id": order_id,
-                "tracking_number": tracking,
-                "carrier": carrier,
-                "vector_id": vector_id,
-            })
+            vector_id = item.get("vector_id")
+            carrier = "GLS" if vector_id == 2 else "Poste Delivery" if vector_id == 17 else "BRT" if vector_id == 1 else f"Carrier_{vector_id}"
+
+            if order_id and tracking:
+                results.append({
+                    "order_id": order_id,
+                    "tracking_number": tracking,
+                    "carrier": carrier,
+                    "vector_id": vector_id,
+                })
+        except Exception as e:
+            print(f"[Tracking] Error processing shipment: {e}")
+            continue  # Don't block other shipments
 
     return results
 
@@ -320,13 +371,14 @@ def _fetch_tracking(session: requests.Session, base_url: str, days_back: int = 1
 
 @app.get("/")
 def health():
-    return {"status": "ok", "service": "codflow-worker", "version": "1.0.0"}
+    return {"status": "ok", "service": "codflow-worker", "version": "1.1.0"}
 
 
 @app.post("/test-connection")
 def test_connection(req: TestRequest):
     _verify_secret(req.secret)
     try:
+        _invalidate_session(req.credentials)  # Force fresh login on test
         s = _login(req.credentials)
         _sessions[f"{req.credentials.base_url}:{req.credentials.email}"] = s
         return {"success": True, "message": "Connessione riuscita"}
@@ -345,19 +397,23 @@ def upload_orders(req: UploadRequest):
         if not req.orders:
             return {"success": True, "uploaded": 0, "skipped": 0, "message": "No orders to upload"}
 
-        # Filter out zero-amount orders
+        # Criticità #11: Filter out zero-amount orders
         valid_orders = [o for o in req.orders if o.amount > 0]
         if not valid_orders:
             return {"success": True, "uploaded": 0, "skipped": len(req.orders), "message": "All orders have zero amount"}
 
-        # Get session
-        session = _get_session(req.credentials)
+        # Get session (with auto-invalidation on failure — Criticità #10)
+        try:
+            session = _get_session(req.credentials)
+        except Exception as e:
+            _invalidate_session(req.credentials)
+            raise Exception(f"Login failed: {e}")
 
-        # Pre-check anti-duplicates
+        # Pre-check anti-duplicates (Criticità #4)
         existing_ids = _get_existing_order_ids(session, req.credentials.base_url)
-        new_orders = [o for o in valid_orders if o.order_id not in existing_ids]
+        new_orders = [o for o in valid_orders if o.order_id.lstrip("#") not in existing_ids]
         skipped = len(valid_orders) - len(new_orders)
-        already_on_spedisci = [o.order_id for o in valid_orders if o.order_id in existing_ids]
+        already_on_spedisci = [o.order_id for o in valid_orders if o.order_id.lstrip("#") in existing_ids]
 
         if not new_orders:
             return {
@@ -369,8 +425,13 @@ def upload_orders(req: UploadRequest):
         # Generate CSV
         csv_content = _generate_csv(new_orders, req.credentials.sender_name)
 
-        # Upload
-        result = _upload_csv(session, req.credentials.base_url, csv_content)
+        # Upload (Criticità #3: only mark success after confirmation)
+        try:
+            result = _upload_csv(session, req.credentials.base_url, csv_content)
+        except Exception as e:
+            # Criticità #10: if upload fails, invalidate session for next attempt
+            _invalidate_session(req.credentials)
+            raise Exception(f"Upload error: {e}")
 
         if result["success"]:
             uploaded_ids = [o.order_id for o in new_orders]
@@ -383,10 +444,12 @@ def upload_orders(req: UploadRequest):
                 "message": f"Upload riuscito: {len(new_orders)} ordini caricati"
             }
         else:
+            # Upload didn't confirm success — invalidate session
+            _invalidate_session(req.credentials)
             return {
                 "success": False,
                 "uploaded": 0,
-                "message": "Upload failed — Spedisci did not confirm success"
+                "message": f"Upload failed — Spedisci did not confirm. Response: {result.get('response_snippet', '')[:100]}"
             }
 
     except Exception as e:
@@ -399,8 +462,38 @@ def upload_orders(req: UploadRequest):
 def fetch_tracking(req: TrackingRequest):
     _verify_secret(req.secret)
     try:
-        session = _get_session(req.credentials)
+        try:
+            session = _get_session(req.credentials)
+        except Exception as e:
+            _invalidate_session(req.credentials)
+            raise Exception(f"Login failed: {e}")
+
         results = _fetch_tracking(session, req.credentials.base_url, req.days_back)
         return {"success": True, "tracking": results, "count": len(results)}
     except Exception as e:
         return {"success": False, "tracking": [], "message": str(e)}
+
+
+@app.post("/reconcile")
+def reconcile(req: ReconcileRequest):
+    """Criticità #4: Reconciliation — check which 'caricato' orders actually exist on Spedisci.
+    Returns list of order_ids that are NOT found on Spedisci (ghosts)."""
+    _verify_secret(req.secret)
+    try:
+        session = _get_session(req.credentials)
+        existing_ids = _get_existing_order_ids(session, req.credentials.base_url, days_back=30)
+
+        ghost_ids = []
+        for oid in req.order_ids:
+            clean_oid = oid.lstrip("#")
+            if clean_oid not in existing_ids:
+                ghost_ids.append(oid)
+
+        return {
+            "success": True,
+            "ghost_ids": ghost_ids,
+            "confirmed_on_spedisci": len(req.order_ids) - len(ghost_ids),
+            "message": f"{len(ghost_ids)} ordini fantasma trovati" if ghost_ids else "Tutti gli ordini sono su Spedisci"
+        }
+    except Exception as e:
+        return {"success": False, "ghost_ids": [], "message": str(e)}
