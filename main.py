@@ -276,14 +276,30 @@ def _upload_csv(session: requests.Session, base_url: str, csv_content: str) -> d
     """Upload CSV to Spedisci."""
     base = base_url.rstrip("/")
 
-    # Step 1: GET import page → CSRF
-    r = session.get(f"{base}/orders/import", timeout=15, allow_redirects=True)
-    r.raise_for_status()
-    csrf = _extract_csrf(r.text)
+    # Step 1: Get CSRF token — try multiple pages since some may be JS-rendered
+    csrf = None
+    for page in ["/orders/import", "/home", "/orders"]:
+        try:
+            r = session.get(f"{base}{page}", timeout=15, allow_redirects=True)
+            r.raise_for_status()
+            csrf = _extract_csrf(r.text)
+            if csrf:
+                break
+        except:
+            continue
+
     if not csrf:
-        # Debug: log what we got
-        snippet = r.text[:500].replace("\n", " ")
-        raise Exception(f"CSRF not found on import page. URL: {r.url}, Status: {r.status_code}, HTML: {snippet[:200]}")
+        # Fallback: get CSRF from meta tag
+        try:
+            r = session.get(f"{base}/home", timeout=15)
+            m = re.search(r'<meta\s+name="csrf-token"\s+content="([^"]+)"', r.text)
+            if m:
+                csrf = m.group(1)
+        except:
+            pass
+
+    if not csrf:
+        raise Exception("CSRF token not found on any page — session may be invalid")
 
     # Get XSRF token (Criticità #2: always get LAST cookie)
     xsrf = _get_xsrf_token(session)
