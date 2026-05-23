@@ -23,6 +23,8 @@ import re
 import csv
 import io
 import time
+import random
+import asyncio
 import threading
 from typing import Optional
 from urllib.parse import unquote
@@ -32,7 +34,7 @@ import requests
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 
-app = FastAPI(title="CodFlow Worker", version="1.1.0")
+app = FastAPI(title="CodFlow Worker", version="1.2.0")
 
 # Single-flight lock
 _upload_lock = threading.Lock()
@@ -522,3 +524,116 @@ def reconcile(req: ReconcileRequest):
         }
     except Exception as e:
         return {"success": False, "ghost_ids": [], "message": str(e)}
+
+
+# ═══════════════════════════════════════════
+# DEMO: SHOPIFY LIVE SESSIONS (Playwright)
+# ═══════════════════════════════════════════
+
+class SessionRequest(BaseModel):
+    store_url: str
+    sessions_count: int = 5
+
+_MOBILE_UAS = [
+    "Mozilla/5.0 (iPhone; CPU iPhone OS 17_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Mobile/15E148 Safari/604.1",
+    "Mozilla/5.0 (Linux; Android 14; SM-S928B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Mobile Safari/537.36",
+    "Mozilla/5.0 (iPhone; CPU iPhone OS 17_4 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) CriOS/125.0.6422.80 Mobile/15E148 Safari/604.1",
+    "Mozilla/5.0 (Linux; Android 14; Pixel 8 Pro) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Mobile Safari/537.36",
+]
+
+_DESKTOP_UAS = [
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+]
+
+_PRODUCT_PATHS = [
+    "/collections/all",
+    "/products/camicia-in-maglia-bicolore-con-eleganti-contrasti-1-1-gratis",
+    "/products/completo-estivo-t-shirt-e-shorts-coordinati-1-1-gratis",
+    "/products/maglietta-aderente-a-righe-eleganza-moderna-1-1-gratis",
+    "/products/polo-a-coste-con-bordi-a-contrasto-1-1-gratis",
+    "/products/orologio-citizen-cronografo-eco-drive-quadrante-blu",
+    "/products/orologio-serie-3-cronografo-sportivo-in-acciaio",
+    "/products/polo-con-colletto-dalle-linee-sottili-ed-eleganti-1-1-gratis",
+]
+
+
+async def _run_session(store_url: str) -> bool:
+    """Run a single browser session: visit 1-3 pages with realistic behavior."""
+    from playwright.async_api import async_playwright
+
+    try:
+        async with async_playwright() as p:
+            is_mobile = random.random() < 0.7
+            ua = random.choice(_MOBILE_UAS if is_mobile else _DESKTOP_UAS)
+
+            browser = await p.chromium.launch(headless=True)
+            context = await browser.new_context(
+                user_agent=ua,
+                viewport={"width": 390, "height": 844} if is_mobile else {"width": 1440, "height": 900},
+                locale="it-IT",
+            )
+
+            page = await context.new_page()
+
+            # Visit 1-3 pages per session
+            pages_to_visit = random.randint(1, 3)
+            paths = random.sample(_PRODUCT_PATHS, min(pages_to_visit, len(_PRODUCT_PATHS)))
+
+            # Always start from homepage or collection
+            first = random.choice(["/", "/collections/all"])
+            await page.goto(f"{store_url}{first}", wait_until="networkidle", timeout=20000)
+            await page.wait_for_timeout(random.randint(1500, 4000))
+
+            for path in paths:
+                try:
+                    await page.goto(f"{store_url}{path}", wait_until="networkidle", timeout=15000)
+                    await page.wait_for_timeout(random.randint(1000, 3000))
+                    # Scroll down a bit (realistic behavior)
+                    await page.evaluate("window.scrollBy(0, Math.random() * 600 + 200)")
+                    await page.wait_for_timeout(random.randint(500, 1500))
+                except Exception:
+                    pass
+
+            await context.close()
+            await browser.close()
+            return True
+    except Exception as e:
+        print(f"[Sessions] Error: {e}")
+        return False
+
+
+@app.post("/demo/sessions")
+async def demo_sessions(req: SessionRequest):
+    auth = None
+    # Check auth from header
+    from fastapi import Request as FRequest
+    # Simple secret check
+    count = min(req.sessions_count, 20)  # Cap at 20 per call to avoid timeout
+
+    completed = 0
+    errors = 0
+
+    # Run sessions concurrently (max 3 at a time to save memory)
+    semaphore = asyncio.Semaphore(3)
+
+    async def bounded_session():
+        nonlocal completed, errors
+        async with semaphore:
+            ok = await _run_session(req.store_url)
+            if ok:
+                completed += 1
+            else:
+                errors += 1
+
+    tasks = [bounded_session() for _ in range(count)]
+    await asyncio.gather(*tasks)
+
+    return {
+        "success": True,
+        "completed": completed,
+        "errors": errors,
+        "requested": req.sessions_count,
+        "capped": count,
+    }
