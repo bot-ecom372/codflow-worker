@@ -585,7 +585,11 @@ async def _run_session(store_url: str) -> bool:
             is_mobile = random.random() < 0.7
             ua = random.choice(_MOBILE_UAS if is_mobile else _DESKTOP_UAS)
 
-            browser = await p.chromium.launch(headless=True, args=["--no-sandbox", "--disable-setuid-sandbox"])
+            browser = await p.chromium.launch(headless=True, args=[
+                "--no-sandbox", "--disable-setuid-sandbox",
+                "--disable-dev-shm-usage", "--disable-gpu",
+                "--single-process",
+            ])
             context = await browser.new_context(
                 user_agent=ua,
                 viewport={"width": 390, "height": 844} if is_mobile else {"width": 1440, "height": 900},
@@ -594,21 +598,18 @@ async def _run_session(store_url: str) -> bool:
 
             page = await context.new_page()
 
-            pages_to_visit = random.randint(1, 3)
-            paths = random.sample(_PRODUCT_PATHS, min(pages_to_visit, len(_PRODUCT_PATHS)))
-
             first = random.choice(["/", "/collections/all"])
-            await page.goto(f"{store_url}{first}", wait_until="domcontentloaded", timeout=20000)
-            await page.wait_for_timeout(random.randint(1500, 4000))
+            await page.goto(f"{store_url}{first}", wait_until="domcontentloaded", timeout=30000)
+            await page.wait_for_timeout(random.randint(2000, 5000))
 
-            for path in paths:
-                try:
-                    await page.goto(f"{store_url}{path}", wait_until="domcontentloaded", timeout=15000)
-                    await page.wait_for_timeout(random.randint(1000, 3000))
-                    await page.evaluate("window.scrollBy(0, Math.random() * 600 + 200)")
-                    await page.wait_for_timeout(random.randint(500, 1500))
-                except Exception:
-                    pass
+            path = random.choice(_PRODUCT_PATHS)
+            try:
+                await page.goto(f"{store_url}{path}", wait_until="domcontentloaded", timeout=30000)
+                await page.wait_for_timeout(random.randint(1500, 4000))
+                await page.evaluate("window.scrollBy(0, Math.random() * 600 + 200)")
+                await page.wait_for_timeout(random.randint(500, 2000))
+            except Exception:
+                pass
 
             await context.close()
             await browser.close()
