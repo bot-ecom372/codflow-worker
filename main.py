@@ -559,6 +559,23 @@ _PRODUCT_PATHS = [
 ]
 
 
+@app.get("/demo/test-playwright")
+async def test_playwright():
+    """Debug endpoint to verify Playwright works."""
+    from playwright.async_api import async_playwright
+    try:
+        async with async_playwright() as p:
+            browser = await p.chromium.launch(headless=True, args=["--no-sandbox", "--disable-setuid-sandbox"])
+            page = await browser.new_page()
+            await page.goto("https://shopbelmonti.com", timeout=30000)
+            title = await page.title()
+            await browser.close()
+            return {"success": True, "title": title}
+    except Exception as e:
+        import traceback
+        return {"success": False, "error": str(e), "traceback": traceback.format_exc()}
+
+
 async def _run_session(store_url: str) -> bool:
     """Run a single browser session: visit 1-3 pages with realistic behavior."""
     from playwright.async_api import async_playwright
@@ -568,7 +585,7 @@ async def _run_session(store_url: str) -> bool:
             is_mobile = random.random() < 0.7
             ua = random.choice(_MOBILE_UAS if is_mobile else _DESKTOP_UAS)
 
-            browser = await p.chromium.launch(headless=True)
+            browser = await p.chromium.launch(headless=True, args=["--no-sandbox", "--disable-setuid-sandbox"])
             context = await browser.new_context(
                 user_agent=ua,
                 viewport={"width": 390, "height": 844} if is_mobile else {"width": 1440, "height": 900},
@@ -577,11 +594,9 @@ async def _run_session(store_url: str) -> bool:
 
             page = await context.new_page()
 
-            # Visit 1-3 pages per session
             pages_to_visit = random.randint(1, 3)
             paths = random.sample(_PRODUCT_PATHS, min(pages_to_visit, len(_PRODUCT_PATHS)))
 
-            # Always start from homepage or collection
             first = random.choice(["/", "/collections/all"])
             await page.goto(f"{store_url}{first}", wait_until="networkidle", timeout=20000)
             await page.wait_for_timeout(random.randint(1500, 4000))
@@ -590,7 +605,6 @@ async def _run_session(store_url: str) -> bool:
                 try:
                     await page.goto(f"{store_url}{path}", wait_until="networkidle", timeout=15000)
                     await page.wait_for_timeout(random.randint(1000, 3000))
-                    # Scroll down a bit (realistic behavior)
                     await page.evaluate("window.scrollBy(0, Math.random() * 600 + 200)")
                     await page.wait_for_timeout(random.randint(500, 1500))
                 except Exception:
