@@ -598,12 +598,12 @@ async def _run_session(store_url: str) -> bool:
             paths = random.sample(_PRODUCT_PATHS, min(pages_to_visit, len(_PRODUCT_PATHS)))
 
             first = random.choice(["/", "/collections/all"])
-            await page.goto(f"{store_url}{first}", wait_until="networkidle", timeout=20000)
+            await page.goto(f"{store_url}{first}", wait_until="domcontentloaded", timeout=20000)
             await page.wait_for_timeout(random.randint(1500, 4000))
 
             for path in paths:
                 try:
-                    await page.goto(f"{store_url}{path}", wait_until="networkidle", timeout=15000)
+                    await page.goto(f"{store_url}{path}", wait_until="domcontentloaded", timeout=15000)
                     await page.wait_for_timeout(random.randint(1000, 3000))
                     await page.evaluate("window.scrollBy(0, Math.random() * 600 + 200)")
                     await page.wait_for_timeout(random.randint(500, 1500))
