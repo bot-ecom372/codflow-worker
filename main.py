@@ -654,6 +654,7 @@ async def demo_sessions(req: SessionRequest):
     completed = 0
     errors = 0
 
+    debug_info = ""
     try:
         script = _session_script(req.store_url, count)
         proc = subprocess.run(
@@ -666,20 +667,26 @@ async def demo_sessions(req: SessionRequest):
             errors = result.get("errors", 0)
         else:
             errors = count
-            print(f"[Sessions] Subprocess failed: rc={proc.returncode} stderr={proc.stderr[:200]}")
+            debug_info = f"rc={proc.returncode} stderr={proc.stderr[:500]} stdout={proc.stdout[:200]}"
+            print(f"[Sessions] Subprocess failed: {debug_info}")
     except subprocess.TimeoutExpired:
         print("[Sessions] Subprocess killed after 50s timeout")
+        debug_info = "timeout_50s"
         errors = count
     except Exception as e:
         print(f"[Sessions] Error: {e}")
+        debug_info = str(e)[:200]
         errors = count
     finally:
         _session_busy = False
 
-    return {
+    resp = {
         "success": True,
         "completed": completed,
         "errors": errors,
         "requested": req.sessions_count,
         "capped": count,
     }
+    if debug_info:
+        resp["debug"] = debug_info
+    return resp
