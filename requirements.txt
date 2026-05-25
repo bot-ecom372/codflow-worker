@@ -4,3 +4,4 @@ requests==2.32.0
 pyotp==2.9.0
 python-multipart==0.0.9
 playwright==1.49.1
+playwright-stealth==1.0.6

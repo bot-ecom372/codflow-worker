@@ -621,7 +621,8 @@ async def _get_browser():
 
 
 async def _single_visit(browser, store_url: str) -> bool:
-    """Single visit: open context, load page, wait for analytics JS, close."""
+    """Single visit: stealth context, load page, wait for analytics JS, close."""
+    from playwright_stealth import stealth_async
     ctx = None
     try:
         is_mobile = random.random() < 0.7
@@ -632,12 +633,13 @@ async def _single_visit(browser, store_url: str) -> bool:
             locale="it-IT",
         )
         page = await ctx.new_page()
+        await stealth_async(page)
         path = random.choice(["/", "/collections/all"] + _PRODUCT_PATHS)
         try:
             await page.goto(f"{store_url}{path}", wait_until="domcontentloaded", timeout=8000)
         except Exception:
             pass
-        await asyncio.sleep(2)
+        await asyncio.sleep(3)
         await ctx.close()
         return True
     except Exception as e:
