@@ -572,18 +572,20 @@ async def demo_sessions(req: SessionRequest):
 
     status_codes = []
 
+    last_error = ""
+
     async def _visit(store_url: str) -> int:
+        nonlocal last_error
         try:
             is_mobile = random.random() < 0.7
             ua = random.choice(_MOBILE_UAS if is_mobile else _DESKTOP_UAS)
             path = random.choice(paths)
             url = f"{store_url.rstrip('/')}{path}"
-            async with httpx.AsyncClient(timeout=15, follow_redirects=True, http2=True) as client:
+            async with httpx.AsyncClient(timeout=15, follow_redirects=True) as client:
                 resp = await client.get(url, headers={
                     "User-Agent": ua,
                     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
                     "Accept-Language": "it-IT,it;q=0.9,en-US;q=0.8,en;q=0.7",
-                    "Accept-Encoding": "gzip, deflate, br",
                     "Upgrade-Insecure-Requests": "1",
                     "Sec-Fetch-Dest": "document",
                     "Sec-Fetch-Mode": "navigate",
@@ -592,6 +594,7 @@ async def demo_sessions(req: SessionRequest):
                 })
                 return resp.status_code
         except Exception as e:
+            last_error = f"{type(e).__name__}: {str(e)[:100]}"
             return -1
 
     # Run in batches of 5
@@ -608,7 +611,7 @@ async def demo_sessions(req: SessionRequest):
         if i + batch_size < count:
             await asyncio.sleep(1)
 
-    return {
+    resp = {
         "success": True,
         "completed": completed,
         "errors": errors,
@@ -616,3 +619,6 @@ async def demo_sessions(req: SessionRequest):
         "capped": count,
         "status_codes": status_codes,
     }
+    if last_error:
+        resp["last_error"] = last_error
+    return resp
