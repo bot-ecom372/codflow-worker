@@ -559,13 +559,23 @@ _PRODUCT_PATHS = [
 ]
 
 
+def _chromium_path() -> str | None:
+    """Find system chromium binary."""
+    import shutil
+    for p in ["/usr/bin/chromium", "/usr/bin/chromium-browser"]:
+        if os.path.exists(p):
+            return p
+    return shutil.which("chromium") or shutil.which("chromium-browser")
+
+
 @app.get("/demo/test-playwright")
 async def test_playwright():
     """Debug endpoint to verify Playwright works."""
     from playwright.async_api import async_playwright
     try:
         async with async_playwright() as p:
-            browser = await p.chromium.launch(headless=True, args=["--no-sandbox", "--disable-setuid-sandbox"])
+            exe = _chromium_path()
+            browser = await p.chromium.launch(headless=True, executable_path=exe, args=["--no-sandbox", "--disable-setuid-sandbox"])
             page = await browser.new_page()
             await page.goto("https://shopbelmonti.com", timeout=30000)
             title = await page.title()
@@ -585,7 +595,8 @@ async def _run_session(store_url: str) -> bool:
             is_mobile = random.random() < 0.7
             ua = random.choice(_MOBILE_UAS if is_mobile else _DESKTOP_UAS)
 
-            browser = await p.chromium.launch(headless=True, args=[
+            exe = _chromium_path()
+            browser = await p.chromium.launch(headless=True, executable_path=exe, args=[
                 "--no-sandbox", "--disable-setuid-sandbox",
                 "--disable-dev-shm-usage", "--disable-gpu",
                 "--single-process",
