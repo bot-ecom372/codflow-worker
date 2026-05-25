@@ -620,9 +620,22 @@ async def _get_browser():
     return _browser
 
 
+_STEALTH_JS = """
+Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
+Object.defineProperty(navigator, 'languages', {get: () => ['it-IT', 'it', 'en-US', 'en']});
+Object.defineProperty(navigator, 'plugins', {get: () => [1, 2, 3, 4, 5]});
+window.chrome = {runtime: {}};
+const originalQuery = window.navigator.permissions.query;
+window.navigator.permissions.query = (parameters) => (
+  parameters.name === 'notifications' ?
+    Promise.resolve({state: Notification.permission}) :
+    originalQuery(parameters)
+);
+"""
+
+
 async def _single_visit(browser, store_url: str) -> bool:
     """Single visit: stealth context, load page, wait for analytics JS, close."""
-    from playwright_stealth import stealth_async
     ctx = None
     try:
         is_mobile = random.random() < 0.7
@@ -633,7 +646,7 @@ async def _single_visit(browser, store_url: str) -> bool:
             locale="it-IT",
         )
         page = await ctx.new_page()
-        await stealth_async(page)
+        await page.add_init_script(_STEALTH_JS)
         path = random.choice(["/", "/collections/all"] + _PRODUCT_PATHS)
         try:
             await page.goto(f"{store_url}{path}", wait_until="domcontentloaded", timeout=8000)
