@@ -662,7 +662,7 @@ async def _do_visits(store_url: str, count: int) -> tuple[int, int]:
 async def demo_sessions(req: SessionRequest):
     global _session_busy, _session_started_at
 
-    count = min(req.sessions_count, 10)
+    count = min(req.sessions_count, 15)
 
     if _session_busy:
         elapsed = time.time() - _session_started_at
