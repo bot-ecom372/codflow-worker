@@ -583,6 +583,28 @@ _browser = None
 _playwright = None
 
 
+_CHROME_ARGS = [
+    "--no-sandbox", "--disable-setuid-sandbox",
+    "--disable-dev-shm-usage", "--disable-gpu",
+    "--disable-extensions", "--disable-background-networking",
+    "--disable-default-apps", "--disable-sync",
+    "--metrics-recording-only", "--no-first-run",
+]
+
+
+@app.on_event("startup")
+async def _startup_browser():
+    """Pre-launch browser at startup so it's warm for first request."""
+    global _browser, _playwright
+    from playwright.async_api import async_playwright
+    try:
+        _playwright = await async_playwright().start()
+        _browser = await _playwright.chromium.launch(headless=True, args=_CHROME_ARGS)
+        print("[Sessions] Browser pre-launched at startup")
+    except Exception as e:
+        print(f"[Sessions] Startup browser launch failed: {e}")
+
+
 async def _get_browser():
     """Get or create a persistent browser instance."""
     global _browser, _playwright
@@ -595,13 +617,7 @@ async def _get_browser():
         except Exception:
             pass
     _playwright = await async_playwright().start()
-    _browser = await _playwright.chromium.launch(headless=True, args=[
-        "--no-sandbox", "--disable-setuid-sandbox",
-        "--disable-dev-shm-usage", "--disable-gpu",
-        "--disable-extensions", "--disable-background-networking",
-        "--disable-default-apps", "--disable-sync",
-        "--metrics-recording-only", "--no-first-run",
-    ])
+    _browser = await _playwright.chromium.launch(headless=True, args=_CHROME_ARGS)
     return _browser
 
 
