@@ -578,10 +578,9 @@ async def test_playwright():
 
 _session_busy = False
 _session_started_at: float = 0
-_SESSION_MAX_AGE = 45
+_SESSION_MAX_AGE = 55
 _browser = None
 _playwright = None
-
 
 _CHROME_ARGS = [
     "--no-sandbox", "--disable-setuid-sandbox",
@@ -621,46 +620,61 @@ async def _get_browser():
     return _browser
 
 
+async def _single_visit(browser, store_url: str) -> bool:
+    """Single visit: open context, load page, wait for analytics JS, close."""
+    ctx = None
+    try:
+        is_mobile = random.random() < 0.7
+        ua = random.choice(_MOBILE_UAS if is_mobile else _DESKTOP_UAS)
+        ctx = await browser.new_context(
+            user_agent=ua,
+            viewport={"width": 375, "height": 667} if is_mobile else {"width": 1280, "height": 720},
+            locale="it-IT",
+        )
+        page = await ctx.new_page()
+        path = random.choice(["/", "/collections/all"] + _PRODUCT_PATHS)
+        try:
+            await page.goto(f"{store_url}{path}", wait_until="domcontentloaded", timeout=8000)
+        except Exception:
+            pass
+        await asyncio.sleep(2)
+        await ctx.close()
+        return True
+    except Exception as e:
+        print(f"[Sessions] Visit error: {e}")
+        if ctx:
+            try:
+                await ctx.close()
+            except Exception:
+                pass
+        return False
+
+
 async def _do_visits(store_url: str, count: int) -> tuple[int, int]:
-    """Run visits using persistent browser. Fast and light."""
+    """Run visits in parallel batches of 5 using persistent browser."""
     browser = await _get_browser()
     completed = 0
     errors = 0
-    paths = ["/", "/collections/all"] + _PRODUCT_PATHS
+    batch_size = 5
 
-    for i in range(count):
-        ctx = None
-        try:
-            is_mobile = random.random() < 0.7
-            ua = random.choice(_MOBILE_UAS if is_mobile else _DESKTOP_UAS)
-            ctx = await browser.new_context(
-                user_agent=ua,
-                viewport={"width": 375, "height": 667} if is_mobile else {"width": 1280, "height": 720},
-                locale="it-IT",
-            )
-            page = await ctx.new_page()
-            path = random.choice(paths)
-            try:
-                await page.goto(f"{store_url}{path}", wait_until="commit", timeout=6000)
-            except Exception:
-                pass
-            completed += 1
-        except Exception as e:
-            errors += 1
-            print(f"[Sessions] Visit {i} error: {e}")
-        finally:
-            if ctx:
-                try:
-                    await ctx.close()
-                except Exception:
-                    pass
+    for i in range(0, count, batch_size):
+        batch = min(batch_size, count - i)
+        results = await asyncio.gather(
+            *[_single_visit(browser, store_url) for _ in range(batch)],
+            return_exceptions=True,
+        )
+        for r in results:
+            if r is True:
+                completed += 1
+            else:
+                errors += 1
 
     return completed, errors
 
 
 @app.post("/demo/sessions")
 async def demo_sessions(req: SessionRequest):
-    global _session_busy, _session_started_at
+    global _session_busy, _session_started_at, _browser
 
     count = min(req.sessions_count, 15)
 
@@ -680,12 +694,11 @@ async def demo_sessions(req: SessionRequest):
     try:
         completed, errors = await asyncio.wait_for(
             _do_visits(req.store_url, count),
-            timeout=40,
+            timeout=50,
         )
     except asyncio.TimeoutError:
-        debug_info = "timeout_40s"
+        debug_info = "timeout_50s"
         errors = count
-        global _browser
         if _browser:
             try:
                 await _browser.close()
