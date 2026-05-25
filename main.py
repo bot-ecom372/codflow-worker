@@ -694,6 +694,8 @@ async def demo_sessions(req: SessionRequest):
                 result = json_mod.loads(last_line)
                 completed = result.get("completed", 0)
                 errors = result.get("errors", 0)
+                if errors > 0 and stderr_str:
+                    debug_info = f"visit_errors: {stderr_str[:500]}"
             else:
                 errors = count
                 debug_info = f"rc={proc.returncode} stderr={stderr_str[:500]} stdout={stdout_str[:200]}"
