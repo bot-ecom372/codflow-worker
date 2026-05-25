@@ -576,66 +576,55 @@ async def test_playwright():
         return {"success": False, "error": str(e), "traceback": traceback.format_exc()}
 
 
-async def _run_session(store_url: str) -> bool:
-    """Run a single browser session: visit 1-3 pages with realistic behavior."""
-    from playwright.async_api import async_playwright
-
-    try:
-        async with async_playwright() as p:
-            is_mobile = random.random() < 0.7
-            ua = random.choice(_MOBILE_UAS if is_mobile else _DESKTOP_UAS)
-
-            browser = await p.chromium.launch(headless=True, args=[
-                "--no-sandbox", "--disable-setuid-sandbox",
-                "--disable-dev-shm-usage", "--disable-gpu",
-                "--single-process",
-            ])
-            context = await browser.new_context(
-                user_agent=ua,
-                viewport={"width": 390, "height": 844} if is_mobile else {"width": 1440, "height": 900},
-                locale="it-IT",
-            )
-
-            page = await context.new_page()
-
-            first = random.choice(["/", "/collections/all"])
-            await page.goto(f"{store_url}{first}", wait_until="domcontentloaded", timeout=30000)
-            await page.wait_for_timeout(random.randint(2000, 5000))
-
-            path = random.choice(_PRODUCT_PATHS)
-            try:
-                await page.goto(f"{store_url}{path}", wait_until="domcontentloaded", timeout=30000)
-                await page.wait_for_timeout(random.randint(1500, 4000))
-                await page.evaluate("window.scrollBy(0, Math.random() * 600 + 200)")
-                await page.wait_for_timeout(random.randint(500, 2000))
-            except Exception:
-                pass
-
-            await context.close()
-            await browser.close()
-            return True
-    except Exception as e:
-        print(f"[Sessions] Error: {e}")
-        return False
+_session_lock = asyncio.Lock()
 
 
 @app.post("/demo/sessions")
 async def demo_sessions(req: SessionRequest):
-    count = min(req.sessions_count, 10)
+    from playwright.async_api import async_playwright
 
-    completed = 0
-    errors = 0
+    count = min(req.sessions_count, 15)
 
-    # Run sessions sequentially (512MB RAM limit, 1 browser at a time)
-    for _ in range(count):
+    # Global lock: only 1 browser at a time (512MB RAM limit)
+    if _session_lock.locked():
+        return {"success": True, "completed": 0, "errors": 0, "requested": req.sessions_count, "capped": count, "skipped": "busy"}
+
+    async with _session_lock:
+        completed = 0
+        errors = 0
+
         try:
-            ok = await _run_session(req.store_url)
-            if ok:
-                completed += 1
-            else:
-                errors += 1
-        except Exception:
-            errors += 1
+            async with async_playwright() as p:
+                browser = await p.chromium.launch(headless=True, args=[
+                    "--no-sandbox", "--disable-setuid-sandbox",
+                    "--disable-dev-shm-usage", "--disable-gpu",
+                ])
+
+                for _ in range(count):
+                    try:
+                        is_mobile = random.random() < 0.7
+                        ua = random.choice(_MOBILE_UAS if is_mobile else _DESKTOP_UAS)
+                        context = await browser.new_context(
+                            user_agent=ua,
+                            viewport={"width": 390, "height": 844} if is_mobile else {"width": 1440, "height": 900},
+                            locale="it-IT",
+                        )
+                        page = await context.new_page()
+                        path = random.choice(["/", "/collections/all"] + _PRODUCT_PATHS)
+                        await page.goto(f"{req.store_url}{path}", wait_until="domcontentloaded", timeout=15000)
+                        await page.wait_for_timeout(random.randint(2000, 3500))
+                        await context.close()
+                        completed += 1
+                    except Exception:
+                        errors += 1
+                        try:
+                            await context.close()
+                        except Exception:
+                            pass
+
+                await browser.close()
+        except Exception as e:
+            print(f"[Sessions] Browser error: {e}")
 
     return {
         "success": True,
