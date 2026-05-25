@@ -570,13 +570,15 @@ async def demo_sessions(req: SessionRequest):
     errors = 0
     paths = ["/", "/collections/all"] + _PRODUCT_PATHS
 
-    async def _visit(store_url: str) -> bool:
+    status_codes = []
+
+    async def _visit(store_url: str) -> int:
         try:
             is_mobile = random.random() < 0.7
             ua = random.choice(_MOBILE_UAS if is_mobile else _DESKTOP_UAS)
             path = random.choice(paths)
             url = f"{store_url.rstrip('/')}{path}"
-            async with httpx.AsyncClient(timeout=10, follow_redirects=True) as client:
+            async with httpx.AsyncClient(timeout=15, follow_redirects=True, http2=True) as client:
                 resp = await client.get(url, headers={
                     "User-Agent": ua,
                     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
@@ -587,21 +589,24 @@ async def demo_sessions(req: SessionRequest):
                     "Sec-Fetch-Mode": "navigate",
                     "Sec-Fetch-Site": "none",
                     "Sec-Fetch-User": "?1",
-                    "Cache-Control": "max-age=0",
                 })
-                return resp.status_code < 400
-        except Exception:
-            return False
+                return resp.status_code
+        except Exception as e:
+            return -1
 
-    # Run in batches of 10 to avoid Shopify rate limiting
-    batch_size = 10
+    # Run in batches of 5
+    batch_size = 5
     for i in range(0, count, batch_size):
         batch = min(batch_size, count - i)
         results = await asyncio.gather(*[_visit(req.store_url) for _ in range(batch)])
-        completed += sum(1 for r in results if r)
-        errors += sum(1 for r in results if not r)
+        for code in results:
+            status_codes.append(code)
+            if 200 <= code < 400:
+                completed += 1
+            else:
+                errors += 1
         if i + batch_size < count:
-            await asyncio.sleep(0.5)
+            await asyncio.sleep(1)
 
     return {
         "success": True,
@@ -609,4 +614,5 @@ async def demo_sessions(req: SessionRequest):
         "errors": errors,
         "requested": req.sessions_count,
         "capped": count,
+        "status_codes": status_codes,
     }
