@@ -586,37 +586,37 @@ async def demo_sessions(req: SessionRequest):
                     "appClientId": _STOREFRONT_TOKEN,
                     "shopId": _SHOP_ID,
                     "isMerchantRequest": False,
-                    "hydrogenSubchannelId": "0",
                     "isPersistentCookie": True,
                     "uniqToken": str(uuid.uuid4()),
                     "visitToken": str(uuid.uuid4()),
                     "microSessionId": str(uuid.uuid4()),
                     "microSessionCount": 1,
                     "eventType": "page",
-                    "prevEventType": "",
                     "pageType": page["pageType"],
+                    "url": f"{store_url}{page['path']}",
+                    "path": page["path"],
                     "pageUrl": f"{store_url}{page['path']}",
                     "normalizedPageUrl": f"{store_url}{page['path']}",
                     "pageTitle": page["title"],
                     "referrer": "",
                     "navigationType": "navigate",
-                    "navigationApi": "performance",
                     "currency": "EUR",
                     "contentLanguage": "it",
-                    "isBuyerConsentGiven": True,
                 },
                 "metadata": {
                     "event_created_at_ms": now_ms,
+                    "event_sent_at_ms": now_ms,
                 },
             }
 
+            import json as json_mod
             async with httpx.AsyncClient(timeout=10) as client:
                 resp = await client.post(
                     _MONORAIL_URL,
-                    json=payload,
+                    content=json_mod.dumps(payload),
                     headers={
                         "User-Agent": ua,
-                        "Content-Type": "application/json",
+                        "Content-Type": "text/plain",
                         "Origin": store_url,
                         "Referer": f"{store_url}/",
                     },
