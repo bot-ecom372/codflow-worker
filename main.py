@@ -578,34 +578,56 @@ async def test_playwright():
 
 _session_lock = asyncio.Lock()
 
+_SESSION_TIMEOUT = 50  # Hard timeout (seconds) for entire browser operation
 
-async def _visit_page(browser, store_url: str) -> bool:
-    """Single page visit in existing browser — registers as Shopify Live View visitor."""
-    try:
-        is_mobile = random.random() < 0.7
-        ua = random.choice(_MOBILE_UAS if is_mobile else _DESKTOP_UAS)
-        context = await browser.new_context(
-            user_agent=ua,
-            viewport={"width": 390, "height": 844} if is_mobile else {"width": 1440, "height": 900},
-            locale="it-IT",
-        )
-        page = await context.new_page()
-        path = random.choice(["/", "/collections/all"] + _PRODUCT_PATHS)
-        await page.goto(f"{store_url}{path}", wait_until="domcontentloaded", timeout=15000)
-        await context.close()
-        return True
-    except Exception:
+
+async def _run_sessions(store_url: str, count: int) -> tuple[int, int]:
+    """Run browser sessions with hard timeout guarantee."""
+    from playwright.async_api import async_playwright
+
+    completed = 0
+    errors = 0
+
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(headless=True, args=[
+            "--no-sandbox", "--disable-setuid-sandbox",
+            "--disable-dev-shm-usage", "--disable-gpu",
+            "--single-process", "--disable-extensions",
+        ])
+
         try:
-            await context.close()
-        except Exception:
-            pass
-        return False
+            for _ in range(count):
+                try:
+                    is_mobile = random.random() < 0.7
+                    ua = random.choice(_MOBILE_UAS if is_mobile else _DESKTOP_UAS)
+                    context = await browser.new_context(
+                        user_agent=ua,
+                        viewport={"width": 390, "height": 844} if is_mobile else {"width": 1440, "height": 900},
+                        locale="it-IT",
+                    )
+                    page = await context.new_page()
+                    path = random.choice(["/", "/collections/all"] + _PRODUCT_PATHS)
+                    await page.goto(f"{store_url}{path}", wait_until="domcontentloaded", timeout=10000)
+                    completed += 1
+                    await context.close()
+                except Exception as e:
+                    errors += 1
+                    print(f"[Sessions] Visit error: {e}")
+                    try:
+                        await context.close()
+                    except Exception:
+                        pass
+        finally:
+            try:
+                await browser.close()
+            except Exception:
+                pass
+
+    return completed, errors
 
 
 @app.post("/demo/sessions")
 async def demo_sessions(req: SessionRequest):
-    from playwright.async_api import async_playwright
-
     count = min(req.sessions_count, 15)
 
     if _session_lock.locked():
@@ -616,22 +638,12 @@ async def demo_sessions(req: SessionRequest):
         errors = 0
 
         try:
-            async with async_playwright() as p:
-                browser = await p.chromium.launch(headless=True, args=[
-                    "--no-sandbox", "--disable-setuid-sandbox",
-                    "--disable-dev-shm-usage", "--disable-gpu",
-                ])
-
-                # Process in batches of 3 parallel tabs (same browser, low memory)
-                for i in range(0, count, 3):
-                    batch_size = min(3, count - i)
-                    results = await asyncio.gather(
-                        *[_visit_page(browser, req.store_url) for _ in range(batch_size)]
-                    )
-                    completed += sum(1 for r in results if r)
-                    errors += sum(1 for r in results if not r)
-
-                await browser.close()
+            completed, errors = await asyncio.wait_for(
+                _run_sessions(req.store_url, count),
+                timeout=_SESSION_TIMEOUT,
+            )
+        except asyncio.TimeoutError:
+            print(f"[Sessions] Hard timeout after {_SESSION_TIMEOUT}s")
         except Exception as e:
             print(f"[Sessions] Browser error: {e}")
 
