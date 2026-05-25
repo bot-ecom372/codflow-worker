@@ -621,29 +621,21 @@ async def _run_session(store_url: str) -> bool:
 
 @app.post("/demo/sessions")
 async def demo_sessions(req: SessionRequest):
-    auth = None
-    # Check auth from header
-    from fastapi import Request as FRequest
-    # Simple secret check
-    count = min(req.sessions_count, 20)  # Cap at 20 per call to avoid timeout
+    count = min(req.sessions_count, 10)
 
     completed = 0
     errors = 0
 
-    # Run sessions concurrently (max 3 at a time to save memory)
-    semaphore = asyncio.Semaphore(3)
-
-    async def bounded_session():
-        nonlocal completed, errors
-        async with semaphore:
+    # Run sessions sequentially (512MB RAM limit, 1 browser at a time)
+    for _ in range(count):
+        try:
             ok = await _run_session(req.store_url)
             if ok:
                 completed += 1
             else:
                 errors += 1
-
-    tasks = [bounded_session() for _ in range(count)]
-    await asyncio.gather(*tasks)
+        except Exception:
+            errors += 1
 
     return {
         "success": True,
