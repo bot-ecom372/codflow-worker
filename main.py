@@ -565,7 +565,7 @@ async def demo_sessions(req: SessionRequest):
     Each request uses a fresh client (no shared cookies) = unique visitor."""
     import httpx
 
-    count = min(req.sessions_count, 50)
+    count = min(req.sessions_count, 30)
     completed = 0
     errors = 0
     paths = ["/", "/collections/all"] + _PRODUCT_PATHS
@@ -593,10 +593,15 @@ async def demo_sessions(req: SessionRequest):
         except Exception:
             return False
 
-    # Run all visits in parallel — each is a separate HTTP request, ultra fast
-    results = await asyncio.gather(*[_visit(req.store_url) for _ in range(count)])
-    completed = sum(1 for r in results if r)
-    errors = count - completed
+    # Run in batches of 10 to avoid Shopify rate limiting
+    batch_size = 10
+    for i in range(0, count, batch_size):
+        batch = min(batch_size, count - i)
+        results = await asyncio.gather(*[_visit(req.store_url) for _ in range(batch)])
+        completed += sum(1 for r in results if r)
+        errors += sum(1 for r in results if not r)
+        if i + batch_size < count:
+            await asyncio.sleep(0.5)
 
     return {
         "success": True,
