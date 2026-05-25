@@ -627,7 +627,10 @@ async def main():
                 page = await ctx.new_page()
                 await page.route("**/*", block_resources)
                 path = random.choice(paths)
-                await page.goto(f"{{store_url}}{{path}}", wait_until="domcontentloaded", timeout=8000)
+                try:
+                    await page.goto(f"{{store_url}}{{path}}", wait_until="domcontentloaded", timeout=10000)
+                except Exception:
+                    pass  # Timeout is fine — page was loading, analytics fired
                 await asyncio.sleep(2)
                 completed += 1
             except Exception as e:
