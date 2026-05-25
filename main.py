@@ -589,6 +589,12 @@ def _session_script(store_url: str, count: int) -> str:
     return f'''
 import asyncio, random, sys, json
 
+async def block_resources(route):
+    if route.request.resource_type in ("image", "stylesheet", "font", "media"):
+        await route.abort()
+    else:
+        await route.continue_()
+
 async def main():
     from playwright.async_api import async_playwright
     store_url = {repr(store_url)}
@@ -603,9 +609,12 @@ async def main():
         browser = await p.chromium.launch(headless=True, args=[
             "--no-sandbox", "--disable-setuid-sandbox",
             "--disable-dev-shm-usage", "--disable-gpu",
-            "--single-process",
+            "--disable-extensions", "--disable-background-networking",
+            "--disable-default-apps", "--disable-sync",
+            "--metrics-recording-only", "--no-first-run",
         ])
-        for _ in range(count):
+        for i in range(count):
+            ctx = None
             try:
                 is_mobile = random.random() < 0.7
                 ua = random.choice(mobile_uas if is_mobile else desktop_uas)
@@ -613,19 +622,27 @@ async def main():
                     user_agent=ua,
                     viewport={{"width": 390, "height": 844}} if is_mobile else {{"width": 1440, "height": 900}},
                     locale="it-IT",
+                    java_script_enabled=True,
                 )
                 page = await ctx.new_page()
+                await page.route("**/*", block_resources)
                 path = random.choice(paths)
-                await page.goto(f"{{store_url}}{{path}}", wait_until="domcontentloaded", timeout=10000)
+                await page.goto(f"{{store_url}}{{path}}", wait_until="domcontentloaded", timeout=12000)
+                await asyncio.sleep(1)
                 completed += 1
-                await ctx.close()
-            except Exception:
+            except Exception as e:
                 errors += 1
-                try:
-                    await ctx.close()
-                except Exception:
-                    pass
-        await browser.close()
+                print(f"Visit {{i}} error: {{e}}", file=sys.stderr)
+            finally:
+                if ctx:
+                    try:
+                        await ctx.close()
+                    except Exception:
+                        pass
+        try:
+            await browser.close()
+        except Exception:
+            pass
 
     print(json.dumps({{"completed": completed, "errors": errors}}))
 
