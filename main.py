@@ -622,7 +622,7 @@ async def _get_browser():
 
 
 async def _do_visits(store_url: str, count: int) -> tuple[int, int]:
-    """Run visits using persistent browser."""
+    """Run visits using persistent browser. Fast and light."""
     browser = await _get_browser()
     completed = 0
     errors = 0
@@ -635,20 +635,13 @@ async def _do_visits(store_url: str, count: int) -> tuple[int, int]:
             ua = random.choice(_MOBILE_UAS if is_mobile else _DESKTOP_UAS)
             ctx = await browser.new_context(
                 user_agent=ua,
-                viewport={"width": 390, "height": 844} if is_mobile else {"width": 1440, "height": 900},
+                viewport={"width": 375, "height": 667} if is_mobile else {"width": 1280, "height": 720},
                 locale="it-IT",
-                java_script_enabled=True,
             )
             page = await ctx.new_page()
-            async def _block(route):
-                if route.request.resource_type in ("image", "stylesheet", "font", "media"):
-                    await route.abort()
-                else:
-                    await route.continue_()
-            await page.route("**/*", _block)
             path = random.choice(paths)
             try:
-                await page.goto(f"{store_url}{path}", wait_until="domcontentloaded", timeout=8000)
+                await page.goto(f"{store_url}{path}", wait_until="commit", timeout=6000)
             except Exception:
                 pass
             completed += 1
@@ -669,7 +662,7 @@ async def _do_visits(store_url: str, count: int) -> tuple[int, int]:
 async def demo_sessions(req: SessionRequest):
     global _session_busy, _session_started_at
 
-    count = min(req.sessions_count, 5)
+    count = min(req.sessions_count, 10)
 
     if _session_busy:
         elapsed = time.time() - _session_started_at
