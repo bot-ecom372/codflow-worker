@@ -578,7 +578,7 @@ async def test_playwright():
 
 _session_busy = False
 _session_started_at: float = 0
-_SESSION_MAX_AGE = 55  # Force-clear stale lock after this many seconds
+_SESSION_MAX_AGE = 65  # Force-clear stale lock after this many seconds
 
 
 def _session_script(store_url: str, count: int) -> str:
@@ -627,8 +627,8 @@ async def main():
                 page = await ctx.new_page()
                 await page.route("**/*", block_resources)
                 path = random.choice(paths)
-                await page.goto(f"{{store_url}}{{path}}", wait_until="domcontentloaded", timeout=12000)
-                await asyncio.sleep(1)
+                await page.goto(f"{{store_url}}{{path}}", wait_until="domcontentloaded", timeout=8000)
+                await asyncio.sleep(2)
                 completed += 1
             except Exception as e:
                 errors += 1
@@ -656,7 +656,7 @@ async def demo_sessions(req: SessionRequest):
     import json as json_mod
     global _session_busy, _session_started_at
 
-    count = min(req.sessions_count, 15)
+    count = min(req.sessions_count, 5)
 
     # Stale lock recovery: if busy for too long, force-clear
     if _session_busy:
@@ -676,7 +676,7 @@ async def demo_sessions(req: SessionRequest):
         script = _session_script(req.store_url, count)
         proc = subprocess.run(
             ["python3", "-c", script],
-            capture_output=True, text=True, timeout=50,
+            capture_output=True, text=True, timeout=55,
         )
         if proc.returncode == 0 and proc.stdout.strip():
             result = json_mod.loads(proc.stdout.strip().split("\n")[-1])
