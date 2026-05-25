@@ -652,7 +652,6 @@ asyncio.run(main())
 
 @app.post("/demo/sessions")
 async def demo_sessions(req: SessionRequest):
-    import subprocess
     import json as json_mod
     global _session_busy, _session_started_at
 
@@ -674,22 +673,31 @@ async def demo_sessions(req: SessionRequest):
     debug_info = ""
     try:
         script = _session_script(req.store_url, count)
-        proc = subprocess.run(
-            ["python3", "-c", script],
-            capture_output=True, text=True, timeout=55,
+        proc = await asyncio.create_subprocess_exec(
+            "python3", "-c", script,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
         )
-        if proc.returncode == 0 and proc.stdout.strip():
-            result = json_mod.loads(proc.stdout.strip().split("\n")[-1])
-            completed = result.get("completed", 0)
-            errors = result.get("errors", 0)
-        else:
+        try:
+            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=55)
+        except asyncio.TimeoutError:
+            proc.kill()
+            await proc.wait()
+            debug_info = "timeout_55s"
+            print("[Sessions] Subprocess killed after 55s timeout")
             errors = count
-            debug_info = f"rc={proc.returncode} stderr={proc.stderr[:500]} stdout={proc.stdout[:200]}"
-            print(f"[Sessions] Subprocess failed: {debug_info}")
-    except subprocess.TimeoutExpired:
-        print("[Sessions] Subprocess killed after 50s timeout")
-        debug_info = "timeout_50s"
-        errors = count
+        else:
+            stdout_str = stdout.decode().strip()
+            stderr_str = stderr.decode().strip()
+            if proc.returncode == 0 and stdout_str:
+                last_line = stdout_str.split("\n")[-1]
+                result = json_mod.loads(last_line)
+                completed = result.get("completed", 0)
+                errors = result.get("errors", 0)
+            else:
+                errors = count
+                debug_info = f"rc={proc.returncode} stderr={stderr_str[:500]} stdout={stdout_str[:200]}"
+                print(f"[Sessions] Subprocess failed: {debug_info}")
     except Exception as e:
         print(f"[Sessions] Error: {e}")
         debug_info = str(e)[:200]
