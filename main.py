@@ -578,88 +578,83 @@ async def test_playwright():
 
 _session_busy = False
 _session_started_at: float = 0
-_SESSION_MAX_AGE = 65  # Force-clear stale lock after this many seconds
+_SESSION_MAX_AGE = 45
+_browser = None
+_playwright = None
 
 
-def _session_script(store_url: str, count: int) -> str:
-    """Generate a standalone Python script for subprocess execution."""
-    paths = ["/", "/collections/all"] + _PRODUCT_PATHS
-    mobile_uas = _MOBILE_UAS
-    desktop_uas = _DESKTOP_UAS
-    return f'''
-import asyncio, random, sys, json
-
-async def block_resources(route):
-    if route.request.resource_type in ("image", "stylesheet", "font", "media"):
-        await route.abort()
-    else:
-        await route.continue_()
-
-async def main():
+async def _get_browser():
+    """Get or create a persistent browser instance."""
+    global _browser, _playwright
+    if _browser and _browser.is_connected():
+        return _browser
     from playwright.async_api import async_playwright
-    store_url = {repr(store_url)}
-    count = {count}
-    paths = {repr(paths)}
-    mobile_uas = {repr(mobile_uas)}
-    desktop_uas = {repr(desktop_uas)}
-    completed = 0
-    errors = 0
-
-    async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=True, args=[
-            "--no-sandbox", "--disable-setuid-sandbox",
-            "--disable-dev-shm-usage", "--disable-gpu",
-            "--disable-extensions", "--disable-background-networking",
-            "--disable-default-apps", "--disable-sync",
-            "--metrics-recording-only", "--no-first-run",
-        ])
-        for i in range(count):
-            ctx = None
-            try:
-                is_mobile = random.random() < 0.7
-                ua = random.choice(mobile_uas if is_mobile else desktop_uas)
-                ctx = await browser.new_context(
-                    user_agent=ua,
-                    viewport={{"width": 390, "height": 844}} if is_mobile else {{"width": 1440, "height": 900}},
-                    locale="it-IT",
-                    java_script_enabled=True,
-                )
-                page = await ctx.new_page()
-                await page.route("**/*", block_resources)
-                path = random.choice(paths)
-                try:
-                    await page.goto(f"{{store_url}}{{path}}", wait_until="domcontentloaded", timeout=5000)
-                except Exception:
-                    pass  # Timeout is fine — page was loading, analytics fired
-                completed += 1
-            except Exception as e:
-                errors += 1
-                print(f"Visit {{i}} error: {{e}}", file=sys.stderr)
-            finally:
-                if ctx:
-                    try:
-                        await ctx.close()
-                    except Exception:
-                        pass
+    if _playwright:
         try:
-            await browser.close()
+            await _playwright.stop()
         except Exception:
             pass
+    _playwright = await async_playwright().start()
+    _browser = await _playwright.chromium.launch(headless=True, args=[
+        "--no-sandbox", "--disable-setuid-sandbox",
+        "--disable-dev-shm-usage", "--disable-gpu",
+        "--disable-extensions", "--disable-background-networking",
+        "--disable-default-apps", "--disable-sync",
+        "--metrics-recording-only", "--no-first-run",
+    ])
+    return _browser
 
-    print(json.dumps({{"completed": completed, "errors": errors}}))
 
-asyncio.run(main())
-'''
+async def _do_visits(store_url: str, count: int) -> tuple[int, int]:
+    """Run visits using persistent browser."""
+    browser = await _get_browser()
+    completed = 0
+    errors = 0
+    paths = ["/", "/collections/all"] + _PRODUCT_PATHS
+
+    for i in range(count):
+        ctx = None
+        try:
+            is_mobile = random.random() < 0.7
+            ua = random.choice(_MOBILE_UAS if is_mobile else _DESKTOP_UAS)
+            ctx = await browser.new_context(
+                user_agent=ua,
+                viewport={"width": 390, "height": 844} if is_mobile else {"width": 1440, "height": 900},
+                locale="it-IT",
+                java_script_enabled=True,
+            )
+            page = await ctx.new_page()
+            async def _block(route):
+                if route.request.resource_type in ("image", "stylesheet", "font", "media"):
+                    await route.abort()
+                else:
+                    await route.continue_()
+            await page.route("**/*", _block)
+            path = random.choice(paths)
+            try:
+                await page.goto(f"{store_url}{path}", wait_until="domcontentloaded", timeout=8000)
+            except Exception:
+                pass
+            completed += 1
+        except Exception as e:
+            errors += 1
+            print(f"[Sessions] Visit {i} error: {e}")
+        finally:
+            if ctx:
+                try:
+                    await ctx.close()
+                except Exception:
+                    pass
+
+    return completed, errors
 
 
 @app.post("/demo/sessions")
 async def demo_sessions(req: SessionRequest):
-    import json as json_mod
     global _session_busy, _session_started_at
 
     count = min(req.sessions_count, 5)
 
-    # Stale lock recovery: if busy for too long, force-clear
     if _session_busy:
         elapsed = time.time() - _session_started_at
         if elapsed < _SESSION_MAX_AGE:
@@ -671,41 +666,32 @@ async def demo_sessions(req: SessionRequest):
 
     completed = 0
     errors = 0
-
     debug_info = ""
+
     try:
-        script = _session_script(req.store_url, count)
-        proc = await asyncio.create_subprocess_exec(
-            "python3", "-c", script,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
+        completed, errors = await asyncio.wait_for(
+            _do_visits(req.store_url, count),
+            timeout=40,
         )
-        try:
-            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=55)
-        except asyncio.TimeoutError:
-            proc.kill()
-            await proc.wait()
-            debug_info = "timeout_55s"
-            print("[Sessions] Subprocess killed after 55s timeout")
-            errors = count
-        else:
-            stdout_str = stdout.decode().strip()
-            stderr_str = stderr.decode().strip()
-            if proc.returncode == 0 and stdout_str:
-                last_line = stdout_str.split("\n")[-1]
-                result = json_mod.loads(last_line)
-                completed = result.get("completed", 0)
-                errors = result.get("errors", 0)
-                if errors > 0 and stderr_str:
-                    debug_info = f"visit_errors: {stderr_str[:500]}"
-            else:
-                errors = count
-                debug_info = f"rc={proc.returncode} stderr={stderr_str[:500]} stdout={stdout_str[:200]}"
-                print(f"[Sessions] Subprocess failed: {debug_info}")
+    except asyncio.TimeoutError:
+        debug_info = "timeout_40s"
+        errors = count
+        global _browser
+        if _browser:
+            try:
+                await _browser.close()
+            except Exception:
+                pass
+            _browser = None
     except Exception as e:
-        print(f"[Sessions] Error: {e}")
         debug_info = str(e)[:200]
         errors = count
+        if _browser:
+            try:
+                await _browser.close()
+            except Exception:
+                pass
+            _browser = None
     finally:
         _session_busy = False
 
