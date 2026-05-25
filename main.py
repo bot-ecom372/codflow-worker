@@ -527,7 +527,7 @@ def reconcile(req: ReconcileRequest):
 
 
 # ═══════════════════════════════════════════
-# DEMO: SHOPIFY LIVE SESSIONS (Playwright)
+# DEMO: SHOPIFY LIVE SESSIONS (HTTP)
 # ═══════════════════════════════════════════
 
 class SessionRequest(BaseModel):
@@ -559,186 +559,49 @@ _PRODUCT_PATHS = [
 ]
 
 
-@app.get("/demo/test-playwright")
-async def test_playwright():
-    """Debug endpoint to verify Playwright works."""
-    from playwright.async_api import async_playwright
-    try:
-        async with async_playwright() as p:
-            browser = await p.chromium.launch(headless=True, args=["--no-sandbox", "--disable-setuid-sandbox"])
-            page = await browser.new_page()
-            await page.goto("https://shopbelmonti.com", timeout=30000)
-            title = await page.title()
-            await browser.close()
-            return {"success": True, "title": title}
-    except Exception as e:
-        import traceback
-        return {"success": False, "error": str(e), "traceback": traceback.format_exc()}
-
-
-_session_busy = False
-_session_started_at: float = 0
-_SESSION_MAX_AGE = 55
-_browser = None
-_playwright = None
-
-_CHROME_ARGS = [
-    "--no-sandbox", "--disable-setuid-sandbox",
-    "--disable-dev-shm-usage", "--disable-gpu",
-    "--disable-extensions", "--disable-background-networking",
-    "--disable-default-apps", "--disable-sync",
-    "--metrics-recording-only", "--no-first-run",
-]
-
-
-@app.on_event("startup")
-async def _startup_browser():
-    """Pre-launch browser at startup so it's warm for first request."""
-    global _browser, _playwright
-    from playwright.async_api import async_playwright
-    try:
-        _playwright = await async_playwright().start()
-        _browser = await _playwright.chromium.launch(headless=True, args=_CHROME_ARGS)
-        print("[Sessions] Browser pre-launched at startup")
-    except Exception as e:
-        print(f"[Sessions] Startup browser launch failed: {e}")
-
-
-async def _get_browser():
-    """Get or create a persistent browser instance."""
-    global _browser, _playwright
-    if _browser and _browser.is_connected():
-        return _browser
-    from playwright.async_api import async_playwright
-    if _playwright:
-        try:
-            await _playwright.stop()
-        except Exception:
-            pass
-    _playwright = await async_playwright().start()
-    _browser = await _playwright.chromium.launch(headless=True, args=_CHROME_ARGS)
-    return _browser
-
-
-_STEALTH_JS = """
-Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
-Object.defineProperty(navigator, 'languages', {get: () => ['it-IT', 'it', 'en-US', 'en']});
-Object.defineProperty(navigator, 'plugins', {get: () => [1, 2, 3, 4, 5]});
-window.chrome = {runtime: {}};
-const originalQuery = window.navigator.permissions.query;
-window.navigator.permissions.query = (parameters) => (
-  parameters.name === 'notifications' ?
-    Promise.resolve({state: Notification.permission}) :
-    originalQuery(parameters)
-);
-"""
-
-
-async def _single_visit(browser, store_url: str) -> bool:
-    """Single visit: stealth context, load page, wait for analytics JS, close."""
-    ctx = None
-    try:
-        is_mobile = random.random() < 0.7
-        ua = random.choice(_MOBILE_UAS if is_mobile else _DESKTOP_UAS)
-        ctx = await browser.new_context(
-            user_agent=ua,
-            viewport={"width": 375, "height": 667} if is_mobile else {"width": 1280, "height": 720},
-            locale="it-IT",
-        )
-        page = await ctx.new_page()
-        await page.add_init_script(_STEALTH_JS)
-        path = random.choice(["/", "/collections/all"] + _PRODUCT_PATHS)
-        try:
-            await page.goto(f"{store_url}{path}", wait_until="domcontentloaded", timeout=8000)
-        except Exception:
-            pass
-        await asyncio.sleep(3)
-        await ctx.close()
-        return True
-    except Exception as e:
-        print(f"[Sessions] Visit error: {e}")
-        if ctx:
-            try:
-                await ctx.close()
-            except Exception:
-                pass
-        return False
-
-
-async def _do_visits(store_url: str, count: int) -> tuple[int, int]:
-    """Run visits in parallel batches of 5 using persistent browser."""
-    browser = await _get_browser()
-    completed = 0
-    errors = 0
-    batch_size = 5
-
-    for i in range(0, count, batch_size):
-        batch = min(batch_size, count - i)
-        results = await asyncio.gather(
-            *[_single_visit(browser, store_url) for _ in range(batch)],
-            return_exceptions=True,
-        )
-        for r in results:
-            if r is True:
-                completed += 1
-            else:
-                errors += 1
-
-    return completed, errors
-
-
 @app.post("/demo/sessions")
 async def demo_sessions(req: SessionRequest):
-    global _session_busy, _session_started_at, _browser
+    """Generate Shopify Live View sessions via direct HTTP requests.
+    Each request uses a fresh client (no shared cookies) = unique visitor."""
+    import httpx
 
-    count = min(req.sessions_count, 15)
-
-    if _session_busy:
-        elapsed = time.time() - _session_started_at
-        if elapsed < _SESSION_MAX_AGE:
-            return {"success": True, "completed": 0, "errors": 0, "requested": req.sessions_count, "capped": count, "skipped": "busy", "elapsed": round(elapsed)}
-        print(f"[Sessions] Stale lock recovered after {elapsed:.0f}s")
-
-    _session_busy = True
-    _session_started_at = time.time()
-
+    count = min(req.sessions_count, 50)
     completed = 0
     errors = 0
-    debug_info = ""
+    paths = ["/", "/collections/all"] + _PRODUCT_PATHS
 
-    try:
-        completed, errors = await asyncio.wait_for(
-            _do_visits(req.store_url, count),
-            timeout=50,
-        )
-    except asyncio.TimeoutError:
-        debug_info = "timeout_50s"
-        errors = count
-        if _browser:
-            try:
-                await _browser.close()
-            except Exception:
-                pass
-            _browser = None
-    except Exception as e:
-        debug_info = str(e)[:200]
-        errors = count
-        if _browser:
-            try:
-                await _browser.close()
-            except Exception:
-                pass
-            _browser = None
-    finally:
-        _session_busy = False
+    async def _visit(store_url: str) -> bool:
+        try:
+            is_mobile = random.random() < 0.7
+            ua = random.choice(_MOBILE_UAS if is_mobile else _DESKTOP_UAS)
+            path = random.choice(paths)
+            url = f"{store_url.rstrip('/')}{path}"
+            async with httpx.AsyncClient(timeout=10, follow_redirects=True) as client:
+                resp = await client.get(url, headers={
+                    "User-Agent": ua,
+                    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+                    "Accept-Language": "it-IT,it;q=0.9,en-US;q=0.8,en;q=0.7",
+                    "Accept-Encoding": "gzip, deflate, br",
+                    "Upgrade-Insecure-Requests": "1",
+                    "Sec-Fetch-Dest": "document",
+                    "Sec-Fetch-Mode": "navigate",
+                    "Sec-Fetch-Site": "none",
+                    "Sec-Fetch-User": "?1",
+                    "Cache-Control": "max-age=0",
+                })
+                return resp.status_code < 400
+        except Exception:
+            return False
 
-    resp = {
+    # Run all visits in parallel — each is a separate HTTP request, ultra fast
+    results = await asyncio.gather(*[_visit(req.store_url) for _ in range(count)])
+    completed = sum(1 for r in results if r)
+    errors = count - completed
+
+    return {
         "success": True,
         "completed": completed,
         "errors": errors,
         "requested": req.sessions_count,
         "capped": count,
     }
-    if debug_info:
-        resp["debug"] = debug_info
-    return resp
