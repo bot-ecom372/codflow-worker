@@ -612,7 +612,6 @@ async def demo_sessions(req: SessionRequest):
                         page = await context.new_page()
                         path = random.choice(["/", "/collections/all"] + _PRODUCT_PATHS)
                         await page.goto(f"{req.store_url}{path}", wait_until="domcontentloaded", timeout=15000)
-                        await page.wait_for_timeout(random.randint(2000, 3500))
                         await context.close()
                         completed += 1
                     except Exception:
