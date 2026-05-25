@@ -547,78 +547,96 @@ _DESKTOP_UAS = [
     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
 ]
 
-_PRODUCT_PATHS = [
-    "/collections/all",
-    "/products/camicia-in-maglia-bicolore-con-eleganti-contrasti-1-1-gratis",
-    "/products/completo-estivo-t-shirt-e-shorts-coordinati-1-1-gratis",
-    "/products/maglietta-aderente-a-righe-eleganza-moderna-1-1-gratis",
-    "/products/polo-a-coste-con-bordi-a-contrasto-1-1-gratis",
-    "/products/orologio-citizen-cronografo-eco-drive-quadrante-blu",
-    "/products/orologio-serie-3-cronografo-sportivo-in-acciaio",
-    "/products/polo-con-colletto-dalle-linee-sottili-ed-eleganti-1-1-gratis",
+_SHOP_ID = 93789290832
+_STOREFRONT_TOKEN = "f9ec4c2c3b4afaf75d7d8c87bac3d984"
+_MONORAIL_URL = "https://monorail-edge.shopifysvc.com/v1/produce"
+
+_PAGE_TYPES = [
+    {"pageType": "index", "path": "/", "title": "Belmonti & Co"},
+    {"pageType": "collection", "path": "/collections/all", "title": "Tutti i Prodotti"},
+    {"pageType": "product", "path": "/products/camicia-bicolore", "title": "Camicia Bicolore"},
+    {"pageType": "product", "path": "/products/polo-a-coste", "title": "Polo a Coste"},
+    {"pageType": "product", "path": "/products/orologio-citizen", "title": "Orologio Citizen"},
+    {"pageType": "collection", "path": "/collections/uomo", "title": "Abbigliamento Uomo"},
 ]
+
+import uuid
 
 
 @app.post("/demo/sessions")
 async def demo_sessions(req: SessionRequest):
-    """Generate Shopify Live View sessions via direct HTTP requests.
-    Each request uses a fresh client (no shared cookies) = unique visitor."""
+    """Generate Shopify Live View sessions by posting page_view events
+    directly to Shopify's monorail analytics endpoint."""
     import httpx
 
-    count = min(req.sessions_count, 30)
+    count = min(req.sessions_count, 50)
     completed = 0
     errors = 0
-    paths = ["/", "/collections/all"] + _PRODUCT_PATHS
+    store_url = req.store_url.rstrip("/")
 
-    status_codes = []
-
-    last_error = ""
-
-    async def _visit(store_url: str) -> int:
-        nonlocal last_error
+    async def _send_event() -> bool:
         try:
-            is_mobile = random.random() < 0.7
-            ua = random.choice(_MOBILE_UAS if is_mobile else _DESKTOP_UAS)
-            path = random.choice(paths)
-            url = f"{store_url.rstrip('/')}{path}"
-            async with httpx.AsyncClient(timeout=15, follow_redirects=True) as client:
-                resp = await client.get(url, headers={
-                    "User-Agent": ua,
-                    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-                    "Accept-Language": "it-IT,it;q=0.9,en-US;q=0.8,en;q=0.7",
-                    "Upgrade-Insecure-Requests": "1",
-                    "Sec-Fetch-Dest": "document",
-                    "Sec-Fetch-Mode": "navigate",
-                    "Sec-Fetch-Site": "none",
-                    "Sec-Fetch-User": "?1",
-                })
-                return resp.status_code
-        except Exception as e:
-            last_error = f"{type(e).__name__}: {str(e)[:100]}"
-            return -1
+            page = random.choice(_PAGE_TYPES)
+            ua = random.choice(_MOBILE_UAS if random.random() < 0.7 else _DESKTOP_UAS)
+            now_ms = int(time.time() * 1000)
 
-    # Run in batches of 5
-    batch_size = 5
+            payload = {
+                "schema_id": "trekkie_storefront_page_view/1.2",
+                "payload": {
+                    "appClientId": _STOREFRONT_TOKEN,
+                    "shopId": _SHOP_ID,
+                    "isMerchantRequest": False,
+                    "hydrogenSubchannelId": "0",
+                    "isPersistentCookie": True,
+                    "uniqToken": str(uuid.uuid4()),
+                    "visitToken": str(uuid.uuid4()),
+                    "microSessionId": str(uuid.uuid4()),
+                    "microSessionCount": 1,
+                    "eventType": "page",
+                    "prevEventType": "",
+                    "pageType": page["pageType"],
+                    "pageUrl": f"{store_url}{page['path']}",
+                    "normalizedPageUrl": f"{store_url}{page['path']}",
+                    "pageTitle": page["title"],
+                    "referrer": "",
+                    "navigationType": "navigate",
+                    "navigationApi": "performance",
+                    "currency": "EUR",
+                    "contentLanguage": "it",
+                    "isBuyerConsentGiven": True,
+                },
+                "metadata": {
+                    "event_created_at_ms": now_ms,
+                },
+            }
+
+            async with httpx.AsyncClient(timeout=10) as client:
+                resp = await client.post(
+                    _MONORAIL_URL,
+                    json=payload,
+                    headers={
+                        "User-Agent": ua,
+                        "Content-Type": "application/json",
+                        "Origin": store_url,
+                        "Referer": f"{store_url}/",
+                    },
+                )
+                return resp.status_code < 400
+        except Exception:
+            return False
+
+    # Fire all in parallel batches of 10
+    batch_size = 10
     for i in range(0, count, batch_size):
         batch = min(batch_size, count - i)
-        results = await asyncio.gather(*[_visit(req.store_url) for _ in range(batch)])
-        for code in results:
-            status_codes.append(code)
-            if 200 <= code < 400:
-                completed += 1
-            else:
-                errors += 1
-        if i + batch_size < count:
-            await asyncio.sleep(1)
+        results = await asyncio.gather(*[_send_event() for _ in range(batch)])
+        completed += sum(1 for r in results if r)
+        errors += sum(1 for r in results if not r)
 
-    resp = {
+    return {
         "success": True,
         "completed": completed,
         "errors": errors,
         "requested": req.sessions_count,
         "capped": count,
-        "status_codes": status_codes,
     }
-    if last_error:
-        resp["last_error"] = last_error
-    return resp
