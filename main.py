@@ -576,15 +576,26 @@ async def test_playwright():
         return {"success": False, "error": str(e), "traceback": traceback.format_exc()}
 
 
-_session_lock = asyncio.Lock()
+_session_busy = False
+_session_started_at: float = 0
+_SESSION_MAX_AGE = 55  # Force-clear stale lock after this many seconds
 
-_SESSION_TIMEOUT = 50  # Hard timeout (seconds) for entire browser operation
 
+def _session_script(store_url: str, count: int) -> str:
+    """Generate a standalone Python script for subprocess execution."""
+    paths = ["/", "/collections/all"] + _PRODUCT_PATHS
+    mobile_uas = _MOBILE_UAS
+    desktop_uas = _DESKTOP_UAS
+    return f'''
+import asyncio, random, sys, json
 
-async def _run_sessions(store_url: str, count: int) -> tuple[int, int]:
-    """Run browser sessions with hard timeout guarantee."""
+async def main():
     from playwright.async_api import async_playwright
-
+    store_url = {repr(store_url)}
+    count = {count}
+    paths = {repr(paths)}
+    mobile_uas = {repr(mobile_uas)}
+    desktop_uas = {repr(desktop_uas)}
     completed = 0
     errors = 0
 
@@ -592,60 +603,78 @@ async def _run_sessions(store_url: str, count: int) -> tuple[int, int]:
         browser = await p.chromium.launch(headless=True, args=[
             "--no-sandbox", "--disable-setuid-sandbox",
             "--disable-dev-shm-usage", "--disable-gpu",
-            "--single-process", "--disable-extensions",
+            "--single-process",
         ])
-
-        try:
-            for _ in range(count):
-                try:
-                    is_mobile = random.random() < 0.7
-                    ua = random.choice(_MOBILE_UAS if is_mobile else _DESKTOP_UAS)
-                    context = await browser.new_context(
-                        user_agent=ua,
-                        viewport={"width": 390, "height": 844} if is_mobile else {"width": 1440, "height": 900},
-                        locale="it-IT",
-                    )
-                    page = await context.new_page()
-                    path = random.choice(["/", "/collections/all"] + _PRODUCT_PATHS)
-                    await page.goto(f"{store_url}{path}", wait_until="domcontentloaded", timeout=10000)
-                    completed += 1
-                    await context.close()
-                except Exception as e:
-                    errors += 1
-                    print(f"[Sessions] Visit error: {e}")
-                    try:
-                        await context.close()
-                    except Exception:
-                        pass
-        finally:
+        for _ in range(count):
             try:
-                await browser.close()
+                is_mobile = random.random() < 0.7
+                ua = random.choice(mobile_uas if is_mobile else desktop_uas)
+                ctx = await browser.new_context(
+                    user_agent=ua,
+                    viewport={{"width": 390, "height": 844}} if is_mobile else {{"width": 1440, "height": 900}},
+                    locale="it-IT",
+                )
+                page = await ctx.new_page()
+                path = random.choice(paths)
+                await page.goto(f"{{store_url}}{{path}}", wait_until="domcontentloaded", timeout=10000)
+                completed += 1
+                await ctx.close()
             except Exception:
-                pass
+                errors += 1
+                try:
+                    await ctx.close()
+                except Exception:
+                    pass
+        await browser.close()
 
-    return completed, errors
+    print(json.dumps({{"completed": completed, "errors": errors}}))
+
+asyncio.run(main())
+'''
 
 
 @app.post("/demo/sessions")
 async def demo_sessions(req: SessionRequest):
+    import subprocess
+    import json as json_mod
+    global _session_busy, _session_started_at
+
     count = min(req.sessions_count, 15)
 
-    if _session_lock.locked():
-        return {"success": True, "completed": 0, "errors": 0, "requested": req.sessions_count, "capped": count, "skipped": "busy"}
+    # Stale lock recovery: if busy for too long, force-clear
+    if _session_busy:
+        elapsed = time.time() - _session_started_at
+        if elapsed < _SESSION_MAX_AGE:
+            return {"success": True, "completed": 0, "errors": 0, "requested": req.sessions_count, "capped": count, "skipped": "busy", "elapsed": round(elapsed)}
+        print(f"[Sessions] Stale lock recovered after {elapsed:.0f}s")
 
-    async with _session_lock:
-        completed = 0
-        errors = 0
+    _session_busy = True
+    _session_started_at = time.time()
 
-        try:
-            completed, errors = await asyncio.wait_for(
-                _run_sessions(req.store_url, count),
-                timeout=_SESSION_TIMEOUT,
-            )
-        except asyncio.TimeoutError:
-            print(f"[Sessions] Hard timeout after {_SESSION_TIMEOUT}s")
-        except Exception as e:
-            print(f"[Sessions] Browser error: {e}")
+    completed = 0
+    errors = 0
+
+    try:
+        script = _session_script(req.store_url, count)
+        proc = subprocess.run(
+            ["python3", "-c", script],
+            capture_output=True, text=True, timeout=50,
+        )
+        if proc.returncode == 0 and proc.stdout.strip():
+            result = json_mod.loads(proc.stdout.strip().split("\n")[-1])
+            completed = result.get("completed", 0)
+            errors = result.get("errors", 0)
+        else:
+            errors = count
+            print(f"[Sessions] Subprocess failed: rc={proc.returncode} stderr={proc.stderr[:200]}")
+    except subprocess.TimeoutExpired:
+        print("[Sessions] Subprocess killed after 50s timeout")
+        errors = count
+    except Exception as e:
+        print(f"[Sessions] Error: {e}")
+        errors = count
+    finally:
+        _session_busy = False
 
     return {
         "success": True,
