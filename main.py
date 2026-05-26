@@ -554,10 +554,8 @@ _MONORAIL_URL = "https://monorail-edge.shopifysvc.com/v1/produce"
 _PAGE_TYPES = [
     {"pageType": "index", "path": "/", "title": "Belmonti & Co"},
     {"pageType": "collection", "path": "/collections/all", "title": "Tutti i Prodotti"},
-    {"pageType": "product", "path": "/products/camicia-bicolore", "title": "Camicia Bicolore"},
-    {"pageType": "product", "path": "/products/polo-a-coste", "title": "Polo a Coste"},
-    {"pageType": "product", "path": "/products/orologio-citizen", "title": "Orologio Citizen"},
-    {"pageType": "collection", "path": "/collections/uomo", "title": "Abbigliamento Uomo"},
+    {"pageType": "index", "path": "/", "title": "Home - Belmonti"},
+    {"pageType": "collection", "path": "/collections/all", "title": "Collezione Completa"},
 ]
 
 import uuid
@@ -565,73 +563,104 @@ import uuid
 
 @app.post("/demo/sessions")
 async def demo_sessions(req: SessionRequest):
-    """Generate Shopify Live View sessions by posting page_view events
-    directly to Shopify's monorail analytics endpoint."""
+    """Generate Shopify sessions: GET page (server session) + POST monorail (analytics)."""
     import httpx
+    import json as json_mod
 
-    count = min(req.sessions_count, 50)
+    count = min(req.sessions_count, 30)
     completed = 0
     errors = 0
     store_url = req.store_url.rstrip("/")
 
-    async def _send_event() -> bool:
+    async def _full_visit() -> bool:
         try:
             page = random.choice(_PAGE_TYPES)
             ua = random.choice(_MOBILE_UAS if random.random() < 0.7 else _DESKTOP_UAS)
+            page_url = f"{store_url}{page['path']}"
             now_ms = int(time.time() * 1000)
 
-            payload = {
-                "schema_id": "trekkie_storefront_page_view/1.2",
-                "payload": {
-                    "appClientId": _STOREFRONT_TOKEN,
-                    "shopId": _SHOP_ID,
-                    "isMerchantRequest": False,
-                    "isPersistentCookie": True,
-                    "uniqToken": str(uuid.uuid4()),
-                    "visitToken": str(uuid.uuid4()),
-                    "microSessionId": str(uuid.uuid4()),
-                    "microSessionCount": 1,
-                    "eventType": "page",
-                    "pageType": page["pageType"],
-                    "url": f"{store_url}{page['path']}",
-                    "path": page["path"],
-                    "pageUrl": f"{store_url}{page['path']}",
-                    "normalizedPageUrl": f"{store_url}{page['path']}",
-                    "pageTitle": page["title"],
-                    "referrer": "",
-                    "navigationType": "navigate",
-                    "currency": "EUR",
-                    "contentLanguage": "it",
-                },
-                "metadata": {
-                    "event_created_at_ms": now_ms,
-                    "event_sent_at_ms": now_ms,
-                },
-            }
+            async with httpx.AsyncClient(timeout=12, follow_redirects=True) as client:
+                # Step 1: GET page — creates server-side session, sets _shopify_y/_shopify_s cookies
+                resp = await client.get(page_url, headers={
+                    "User-Agent": ua,
+                    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                    "Accept-Language": "it-IT,it;q=0.9,en-US;q=0.8,en;q=0.7",
+                    "Upgrade-Insecure-Requests": "1",
+                    "Sec-Fetch-Dest": "document",
+                    "Sec-Fetch-Mode": "navigate",
+                    "Sec-Fetch-Site": "none",
+                    "Sec-Fetch-User": "?1",
+                })
+                if resp.status_code >= 400:
+                    return False
 
-            import json as json_mod
-            async with httpx.AsyncClient(timeout=10) as client:
-                resp = await client.post(
+                # Extract session cookies
+                visitor_token = None
+                session_token = None
+                for name, value in resp.cookies.items():
+                    if name == "_shopify_y":
+                        visitor_token = value
+                    elif name == "_shopify_s":
+                        session_token = value
+
+                if not visitor_token:
+                    visitor_token = str(uuid.uuid4())
+                if not session_token:
+                    session_token = str(uuid.uuid4())
+
+                # Step 2: POST analytics event with real session tokens
+                payload = {
+                    "schema_id": "trekkie_storefront_page_view/1.2",
+                    "payload": {
+                        "appClientId": _STOREFRONT_TOKEN,
+                        "shopId": _SHOP_ID,
+                        "isMerchantRequest": False,
+                        "isPersistentCookie": True,
+                        "uniqToken": visitor_token,
+                        "visitToken": session_token,
+                        "microSessionId": str(uuid.uuid4()),
+                        "microSessionCount": 1,
+                        "eventType": "page",
+                        "pageType": page["pageType"],
+                        "url": page_url,
+                        "path": page["path"],
+                        "pageUrl": page_url,
+                        "normalizedPageUrl": page_url,
+                        "pageTitle": page["title"],
+                        "referrer": "",
+                        "navigationType": "navigate",
+                        "currency": "EUR",
+                        "contentLanguage": "it",
+                    },
+                    "metadata": {
+                        "event_created_at_ms": now_ms,
+                        "event_sent_at_ms": now_ms,
+                    },
+                }
+
+                await client.post(
                     _MONORAIL_URL,
                     content=json_mod.dumps(payload),
                     headers={
                         "User-Agent": ua,
                         "Content-Type": "text/plain",
                         "Origin": store_url,
-                        "Referer": f"{store_url}/",
+                        "Referer": page_url,
                     },
                 )
-                return resp.status_code < 400
+                return True
         except Exception:
             return False
 
-    # Fire all in parallel batches of 10
-    batch_size = 10
+    # Batches of 5 (each does HTTP GET + POST = 2 requests)
+    batch_size = 5
     for i in range(0, count, batch_size):
         batch = min(batch_size, count - i)
-        results = await asyncio.gather(*[_send_event() for _ in range(batch)])
+        results = await asyncio.gather(*[_full_visit() for _ in range(batch)])
         completed += sum(1 for r in results if r)
         errors += sum(1 for r in results if not r)
+        if i + batch_size < count:
+            await asyncio.sleep(0.3)
 
     return {
         "success": True,
