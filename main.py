@@ -527,7 +527,7 @@ def reconcile(req: ReconcileRequest):
 
 
 # ═══════════════════════════════════════════
-# DEMO: SHOPIFY LIVE SESSIONS (HTTP)
+# DEMO: SHOPIFY LIVE SESSIONS (Playwright)
 # ═══════════════════════════════════════════
 
 class SessionRequest(BaseModel):
@@ -547,125 +547,116 @@ _DESKTOP_UAS = [
     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
 ]
 
-_SHOP_ID = 93789290832
-_STOREFRONT_TOKEN = "f9ec4c2c3b4afaf75d7d8c87bac3d984"
-_MONORAIL_URL = "https://monorail-edge.shopifysvc.com/v1/produce"
+_PATHS = ["/", "/collections/all"]
 
-_PAGE_TYPES = [
-    {"pageType": "index", "path": "/", "title": "Belmonti & Co"},
-    {"pageType": "collection", "path": "/collections/all", "title": "Tutti i Prodotti"},
-    {"pageType": "index", "path": "/", "title": "Home - Belmonti"},
-    {"pageType": "collection", "path": "/collections/all", "title": "Collezione Completa"},
-]
+_STEALTH_SCRIPT = """
+Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
+Object.defineProperty(navigator, 'languages', {get: () => ['it-IT', 'it', 'en-US', 'en']});
+Object.defineProperty(navigator, 'plugins', {get: () => [1, 2, 3, 4, 5]});
+window.chrome = {runtime: {}, loadTimes: function(){}, csi: function(){}};
+"""
 
-import uuid
+_browser = None
+_playwright_instance = None
+_session_busy = False
+_session_started_at: float = 0
+
+
+@app.on_event("startup")
+async def _launch_browser():
+    global _browser, _playwright_instance
+    from playwright.async_api import async_playwright
+    _playwright_instance = await async_playwright().start()
+    _browser = await _playwright_instance.chromium.launch(
+        headless=True,
+        args=["--disable-blink-features=AutomationControlled", "--no-sandbox", "--disable-dev-shm-usage"],
+    )
+    print("[Sessions] Browser launched at startup")
+
+
+@app.on_event("shutdown")
+async def _close_browser():
+    global _browser, _playwright_instance
+    if _browser:
+        await _browser.close()
+    if _playwright_instance:
+        await _playwright_instance.stop()
 
 
 @app.post("/demo/sessions")
 async def demo_sessions(req: SessionRequest):
-    """Generate Shopify sessions: GET page (server session) + POST monorail (analytics)."""
-    import httpx
-    import json as json_mod
+    """Generate real Shopify sessions via Playwright (JS execution required for analytics)."""
+    global _session_busy, _session_started_at, _browser, _playwright_instance
 
-    count = min(req.sessions_count, 30)
-    completed = 0
-    errors = 0
-    store_url = req.store_url.rstrip("/")
+    # Stale guard: if busy for >50s, force-clear
+    if _session_busy and (time.time() - _session_started_at > 50):
+        _session_busy = False
 
-    async def _full_visit() -> bool:
-        try:
-            page = random.choice(_PAGE_TYPES)
-            ua = random.choice(_MOBILE_UAS if random.random() < 0.7 else _DESKTOP_UAS)
-            page_url = f"{store_url}{page['path']}"
-            now_ms = int(time.time() * 1000)
+    if _session_busy:
+        return {"success": False, "completed": 0, "errors": 0, "message": "busy"}
 
-            async with httpx.AsyncClient(timeout=12, follow_redirects=True) as client:
-                # Step 1: GET page — creates server-side session, sets _shopify_y/_shopify_s cookies
-                resp = await client.get(page_url, headers={
-                    "User-Agent": ua,
-                    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-                    "Accept-Language": "it-IT,it;q=0.9,en-US;q=0.8,en;q=0.7",
-                    "Upgrade-Insecure-Requests": "1",
-                    "Sec-Fetch-Dest": "document",
-                    "Sec-Fetch-Mode": "navigate",
-                    "Sec-Fetch-Site": "none",
-                    "Sec-Fetch-User": "?1",
-                })
-                if resp.status_code >= 400:
-                    return False
+    _session_busy = True
+    _session_started_at = time.time()
 
-                # Extract session cookies
-                visitor_token = None
-                session_token = None
-                for name, value in resp.cookies.items():
-                    if name == "_shopify_y":
-                        visitor_token = value
-                    elif name == "_shopify_s":
-                        session_token = value
+    try:
+        # Restart browser if crashed
+        if not _browser or not _browser.is_connected():
+            from playwright.async_api import async_playwright
+            if _playwright_instance:
+                try:
+                    await _playwright_instance.stop()
+                except:
+                    pass
+            _playwright_instance = await async_playwright().start()
+            _browser = await _playwright_instance.chromium.launch(
+                headless=True,
+                args=["--disable-blink-features=AutomationControlled", "--no-sandbox", "--disable-dev-shm-usage"],
+            )
 
-                if not visitor_token:
-                    visitor_token = str(uuid.uuid4())
-                if not session_token:
-                    session_token = str(uuid.uuid4())
+        count = min(req.sessions_count, 5)
+        completed = 0
+        errors = 0
+        store_url = req.store_url.rstrip("/")
 
-                # Step 2: POST analytics event with real session tokens
-                payload = {
-                    "schema_id": "trekkie_storefront_page_view/1.2",
-                    "payload": {
-                        "appClientId": _STOREFRONT_TOKEN,
-                        "shopId": _SHOP_ID,
-                        "isMerchantRequest": False,
-                        "isPersistentCookie": True,
-                        "uniqToken": visitor_token,
-                        "visitToken": session_token,
-                        "microSessionId": str(uuid.uuid4()),
-                        "microSessionCount": 1,
-                        "eventType": "page",
-                        "pageType": page["pageType"],
-                        "url": page_url,
-                        "path": page["path"],
-                        "pageUrl": page_url,
-                        "normalizedPageUrl": page_url,
-                        "pageTitle": page["title"],
-                        "referrer": "",
-                        "navigationType": "navigate",
-                        "currency": "EUR",
-                        "contentLanguage": "it",
-                    },
-                    "metadata": {
-                        "event_created_at_ms": now_ms,
-                        "event_sent_at_ms": now_ms,
-                    },
-                }
+        for i in range(count):
+            try:
+                ua = random.choice(_MOBILE_UAS if random.random() < 0.7 else _DESKTOP_UAS)
+                is_mobile = "Mobile" in ua
+                path = random.choice(_PATHS)
+                page_url = f"{store_url}{path}"
 
-                await client.post(
-                    _MONORAIL_URL,
-                    content=json_mod.dumps(payload),
-                    headers={
-                        "User-Agent": ua,
-                        "Content-Type": "text/plain",
-                        "Origin": store_url,
-                        "Referer": page_url,
-                    },
+                context = await _browser.new_context(
+                    user_agent=ua,
+                    viewport={"width": 390, "height": 844} if is_mobile else {"width": 1440, "height": 900},
+                    locale="it-IT",
+                    timezone_id="Europe/Rome",
+                    is_mobile=is_mobile,
+                    has_touch=is_mobile,
                 )
-                return True
-        except Exception:
-            return False
+                await context.add_init_script(_STEALTH_SCRIPT)
+                page = await context.new_page()
 
-    # Batches of 5 (each does HTTP GET + POST = 2 requests)
-    batch_size = 5
-    for i in range(0, count, batch_size):
-        batch = min(batch_size, count - i)
-        results = await asyncio.gather(*[_full_visit() for _ in range(batch)])
-        completed += sum(1 for r in results if r)
-        errors += sum(1 for r in results if not r)
-        if i + batch_size < count:
-            await asyncio.sleep(0.3)
+                await page.goto(page_url, wait_until="domcontentloaded", timeout=15000)
+                # Wait for Shopify analytics JS to fire
+                await page.wait_for_timeout(3000)
 
-    return {
-        "success": True,
-        "completed": completed,
-        "errors": errors,
-        "requested": req.sessions_count,
-        "capped": count,
-    }
+                await page.close()
+                await context.close()
+                completed += 1
+            except Exception as e:
+                errors += 1
+                print(f"[Sessions] Visit {i+1} error: {e}")
+                try:
+                    await context.close()
+                except:
+                    pass
+
+        return {
+            "success": True,
+            "completed": completed,
+            "errors": errors,
+            "requested": req.sessions_count,
+            "capped": count,
+        }
+    finally:
+        _session_busy = False
