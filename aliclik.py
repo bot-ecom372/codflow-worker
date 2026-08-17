@@ -383,12 +383,14 @@ class AliclikSession:
         if not end:
             end = datetime.utcnow().strftime("%Y-%m-%d")
         if not start:
-            start = (datetime.utcnow() - timedelta(days=120)).strftime("%Y-%m-%d")
+            start = (datetime.utcnow() - timedelta(days=400)).strftime("%Y-%m-%d")
         q = _norm(query)
         base = {
             "companyId": company_id, "countryCode": country, "parentId": 1,
             "filterDate": "creation", "startDate": start, "endDate": end,
             "limit": page_size,
+            # server-side search finds ANY order (not just the recent pages)
+            "search": query,
         }
         for pg in range(1, max_pages + 1):
             st, body = await self.api_json(
