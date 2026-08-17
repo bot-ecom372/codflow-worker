@@ -140,8 +140,16 @@ class AliclikSession:
                     "--disable-blink-features=AutomationControlled",
                     "--no-sandbox",
                     "--disable-dev-shm-usage",
+                    # Memory-lean flags for the 512MB instance.
+                    "--disable-gpu",
+                    "--disable-extensions",
+                    "--disable-background-networking",
+                    "--disable-background-timer-throttling",
+                    "--disable-renderer-backgrounding",
+                    "--mute-audio",
+                    "--js-flags=--max-old-space-size=160",
                 ],
-                viewport={"width": 1280, "height": 900},
+                viewport={"width": 1024, "height": 768},
             )
         self._page = self._ctx.pages[0] if self._ctx.pages else await self._ctx.new_page()
         p = self._page
