@@ -620,7 +620,15 @@ class AliclikSession:
         prefix = onum[:-len(q_digits)] if (q_digits and onum.endswith(q_digits)) \
             else "BESH15X"
         new_number = f"{prefix}{str(int(datetime.utcnow().timestamp() * 1000))[-7:]}"
+        # Full name goes in shipping.firstName (matches the bundle's
+        # customer.firstName||customer.name). Phone: strip a leading country
+        # code so it isn't doubled with prefixPhone "+51".
+        if phone.startswith("51") and len(phone) > 9:
+            phone = phone[2:]
+        ship_cost = sh.get("shippingCost") or 0
+        # Faithful transcription of aliclik's POST /order builder (36 fields).
         payload = {
+            "assignedSellerId": None,          # only set when role == SELLER
             "orderNumber": new_number,
             "agencyUbigeoId": None,
             "userId": who["userId"],
@@ -630,24 +638,28 @@ class AliclikSession:
             "confirmationGps": gps,
             "note": "",
             "channel": o.get("channel") or "Shopify",
-            "status": o.get("status"),
-            "commissionCod": o.get("commissionCod"),
+            "status": o.get("status") or "PENDING_DELIVERY",
+            "commissionCod": o.get("commissionCod") if o.get("commissionCod") is not None else 0,
             "reason": "",
             "callStatus": "CONFIRMED",
             "subStatus": o.get("subStatus"),
-            "flagDeliveryExpress": o.get("flagDeliveryExpress"),
+            "flagDeliveryExpress": bool(o.get("flagDeliveryExpress")),
             "additionalCostExpress": 0,
             "currency": cur,
             "isOrderAgency": False,
             "trackingStatus": o.get("trackingStatus"),
             "paymentType": o.get("paymentType"),
-            "shippingCost": sh.get("shippingCost") or 0,
+            "shippingCost": ship_cost,
             "managementType": o.get("managementType"),
+            "payAgency": o.get("payAgency"),
             "productDetail": f"{line_qty} {product_name}",
+            "voucherPayAgency": o.get("voucherPayAgency"),
             "warehouseName": o.get("warehouseName"),
             "warehouseId": warehouse_id,
             "createdAtShopify": o.get("createdAtShopify"),
             "transportId": transport_id,
+            "orderRelated": None,              # only set when role == MASTER
+            "productShopifyDetail": o.get("productShopifyDetail"),
             "customer": {"companyId": who["companyId"], "name": customer_name,
                          "lastName": "", "phone": phone},
             "orderDetails": od,
@@ -655,9 +667,12 @@ class AliclikSession:
             "shipping": {
                 "id": sh.get("id"),
                 "operationCode": sh.get("operationCode"),
-                "address1": address, "address2": "", "reference": reference,
+                "orderShalom": sh.get("orderShalom"),
+                "codeShalom": sh.get("codeShalom"),
+                "address1": address, "address2": "", "reference": reference or "",
                 "lat": lat.strip() or "0", "lng": lng.strip() or "0",
-                "firstName": first, "firstLastName": last, "secondLastName": "",
+                "countryName": sh.get("countryName") or "Perú",
+                "firstName": customer_name, "firstLastName": "", "secondLastName": "",
                 "countryCode": "PER",
                 "departmentName": geo["departmentName"],
                 "departmentCode": str(geo["departmentCode"]),
@@ -668,8 +683,17 @@ class AliclikSession:
                 "postalCode": None,
                 "scheduleDate": disp, "dispatchDate": disp,
                 "shippingByAgency": False,
-                "shippingCost": sh.get("shippingCost") or 0,
-                "senderPhone": phone,
+                "agencyName": "", "agencyAddress": "",
+                "contactName": "", "contactPhone": "",
+                "contactDocumenType": "", "contactDocumentNumber": "",
+                "guideNumber": "", "keyCode": "",
+                "attachFile": "", "addressPickUp": "",
+                "shippingCost": ship_cost,
+                "userShalomPro": None, "passwordShalomPro": None,
+                "merchandiseShalom": None,
+                "senderPhone": phone, "senderContact": "",
+                "agencyOrigin": None, "agencyDestination": None,
+                "guideShalom": None, "serieShalom": None,
             },
         }
         if dry_run:
