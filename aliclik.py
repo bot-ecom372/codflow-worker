@@ -146,18 +146,36 @@ class AliclikSession:
         self._page = self._ctx.pages[0] if self._ctx.pages else await self._ctx.new_page()
         p = self._page
 
-        await p.goto(ADMIN + "/", wait_until="networkidle", timeout=45000)
-        await p.wait_for_timeout(2000)
+        await p.goto(ADMIN + "/", wait_until="domcontentloaded", timeout=45000)
+        await p.wait_for_timeout(2500)
         tok = await p.evaluate("() => localStorage.getItem('ALP_AuthToken')")
         if not tok or "/login" in p.url:
-            for _ in range(5):
-                await p.goto(ADMIN + "/login", wait_until="networkidle", timeout=45000)
-                await p.wait_for_timeout(1500)
-                await p.fill("#basic_email", email)
-                await p.fill("#basic_password", password)
-                await p.click('button:has-text("Iniciar sesión")')
+            for _ in range(6):
+                # Avoid a redundant re-navigation when goto('/') already
+                # bounced us to /login (double nav is what times out fill).
+                if "/login" not in p.url:
+                    await p.goto(ADMIN + "/login", wait_until="domcontentloaded",
+                                 timeout=45000)
+                # Wait for the SPA login form to render + settle before filling
+                # (React hydration finishes after networkidle on slow instances).
                 try:
-                    await p.wait_for_url(lambda u: "/login" not in u, timeout=12000)
+                    await p.wait_for_selector("#basic_email", state="visible",
+                                              timeout=20000)
+                    await p.wait_for_selector("#basic_password", state="visible",
+                                              timeout=20000)
+                except Exception:
+                    await p.wait_for_timeout(2000)
+                    continue
+                await p.wait_for_timeout(1200)
+                try:
+                    await p.fill("#basic_email", email, timeout=15000)
+                    await p.fill("#basic_password", password, timeout=15000)
+                    await p.click('button:has-text("Iniciar sesión")', timeout=15000)
+                except Exception:
+                    await p.wait_for_timeout(1500)
+                    continue
+                try:
+                    await p.wait_for_url(lambda u: "/login" not in u, timeout=15000)
                     break
                 except Exception:
                     continue
