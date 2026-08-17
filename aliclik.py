@@ -151,9 +151,22 @@ class AliclikSession:
                 ],
                 viewport={"width": 1024, "height": 768},
             )
+            # Block heavy assets (images/media/fonts) to cut memory + speed up
+            # the 10MB SPA load on the small 512MB instance. Keep JS+CSS so the
+            # login form renders and the auth flow runs.
+            async def _block(route):
+                try:
+                    if route.request.resource_type in ("image", "media", "font"):
+                        await route.abort()
+                    else:
+                        await route.continue_()
+                except Exception:
+                    pass
+            await self._ctx.route("**/*", _block)
         self._page = self._ctx.pages[0] if self._ctx.pages else await self._ctx.new_page()
         p = self._page
 
+        print("[aliclik] login: loading app…", flush=True)
         await p.goto(ADMIN + "/", wait_until="domcontentloaded", timeout=45000)
         await p.wait_for_timeout(2500)
         tok = await self._read_token(p, wait_for_token=False)
@@ -196,7 +209,9 @@ class AliclikSession:
             await p.wait_for_timeout(1500)
         tok = await self._read_token(p, wait_for_token=True)
         if not tok:
+            print("[aliclik] login FAILED: no token after login", flush=True)
             raise HTTPException(status_code=502, detail="Aliclik login failed (no token)")
+        print("[aliclik] login OK (token acquired)", flush=True)
         self._email = email
 
     async def _read_token(self, p, wait_for_token=False):
