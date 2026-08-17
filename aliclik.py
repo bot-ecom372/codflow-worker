@@ -122,6 +122,8 @@ class AliclikSession:
         self._page = None
         self._email: Optional[str] = None
         self._lock = asyncio.Lock()
+        self._who = None          # cached whoami (account-level, never changes)
+        self._geo_cache = {}      # cached ubigeo resolutions (static)
 
     async def _ensure(self, email: str, password: str):
         from playwright.async_api import async_playwright
@@ -277,9 +279,14 @@ class AliclikSession:
         return res["status"], body
 
     async def whoami(self, email, password):
+        if self._who and self._email == email:
+            return self._who
         async with self._lock:
             await self._ensure(email, password)
-            return await self._eval(_WHOAMI_JS)
+            w = await self._eval(_WHOAMI_JS)
+        if w and w.get("companyId"):
+            self._who = w
+        return w
 
     async def _geocode(self, email, password, query):
         """Address -> 'lat,lng' via Photon (OSM, datacenter-friendly — verified
@@ -374,7 +381,19 @@ class AliclikSession:
 
     async def resolve_geo(self, email, password, district, province=None,
                           department=None, country="PER"):
-        """Messy names -> aliclik ubigeo codes. District is the key output."""
+        """Messy names -> aliclik ubigeo codes. District is the key output.
+        Cached: ubigeo tables are static, so repeated resolutions are instant."""
+        ck = (country, _norm(department), _norm(province), _norm(district))
+        if ck in self._geo_cache:
+            return self._geo_cache[ck]
+        result = await self._resolve_geo_uncached(
+            email, password, district, province, department, country)
+        if result:
+            self._geo_cache[ck] = result
+        return result
+
+    async def _resolve_geo_uncached(self, email, password, district, province,
+                                    department, country):
         deps = await self._ubigeo(email, password, country, 1, "")
         dep = self._pick(deps, department) if department else None
         # If department unknown, we must still narrow provinces: try every dep
@@ -406,9 +425,10 @@ class AliclikSession:
 
     # ── orders ───────────────────────────────────────────────────────────
     async def find_order(self, email, password, query, start=None, end=None,
-                         max_pages=12, page_size=50):
+                         max_pages=2, page_size=50):
         """Match a CodFlow order on aliclik by orderNumber, note ("<num> - .."),
-        or delivery address. Scans creation-date pages (newest first)."""
+        or delivery address. Uses the server-side `search` param so the match is
+        on page 1 — no deep scan needed."""
         who = await self.whoami(email, password)
         company_id = who["companyId"]
         country = who["countryCode"]
