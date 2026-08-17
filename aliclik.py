@@ -179,10 +179,38 @@ class AliclikSession:
                     break
                 except Exception:
                     continue
+            # Let the post-login SPA navigation settle so later evaluate() calls
+            # don't hit a destroyed execution context.
+            try:
+                await p.wait_for_load_state("networkidle", timeout=15000)
+            except Exception:
+                pass
+            await p.wait_for_timeout(1500)
         tok = await p.evaluate("() => localStorage.getItem('ALP_AuthToken')")
         if not tok:
             raise HTTPException(status_code=502, detail="Aliclik login failed (no token)")
         self._email = email
+
+    async def _eval(self, js, arg="__none__"):
+        """page.evaluate with a retry on transient navigation teardown."""
+        for attempt in range(3):
+            try:
+                if arg == "__none__":
+                    return await self._page.evaluate(js)
+                return await self._page.evaluate(js, arg)
+            except Exception as e:
+                if "context was destroyed" in str(e) or "Execution context" in str(e):
+                    try:
+                        await self._page.wait_for_load_state("networkidle", timeout=10000)
+                    except Exception:
+                        pass
+                    await self._page.wait_for_timeout(1200)
+                    continue
+                raise
+        # last try, let it raise if still broken
+        if arg == "__none__":
+            return await self._page.evaluate(js)
+        return await self._page.evaluate(js, arg)
 
     async def api(self, email, password, path, method="GET", params=None, data=None):
         async with self._lock:
@@ -190,7 +218,7 @@ class AliclikSession:
             # stringify param values (URLSearchParams wants strings)
             if params:
                 params = {k: ("" if v is None else str(v)) for k, v in params.items()}
-            res = await self._page.evaluate(
+            res = await self._eval(
                 _API_JS,
                 {"base": ALICLIK_API, "path": path, "method": method,
                  "params": params, "data": data},
@@ -208,7 +236,7 @@ class AliclikSession:
     async def whoami(self, email, password):
         async with self._lock:
             await self._ensure(email, password)
-            return await self._page.evaluate(_WHOAMI_JS)
+            return await self._eval(_WHOAMI_JS)
 
     # ── geo ──────────────────────────────────────────────────────────────
     async def _ubigeo(self, email, password, country, nivel, parent_id):
