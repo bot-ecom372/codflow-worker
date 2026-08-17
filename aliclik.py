@@ -402,10 +402,13 @@ class AliclikSession:
                 break
             for o in result:
                 delivery = (o.get("orderDeliveries") or [{}])[0] or {}
+                ship = o.get("shipping") or {}
                 num = _norm(o.get("orderNumber"))
                 note = _norm(o.get("note"))
-                addr = _norm(delivery.get("address"))
-                if (num == q or note == q
+                addr = _norm(delivery.get("address") or ship.get("address1"))
+                # aliclik orderNumber is "<prefix><orderNumber>" (e.g. BESH15X2561);
+                # match the CodFlow number as a suffix too.
+                if (num == q or num.endswith(q) or note == q
                         or note.startswith(q + " ") or note.startswith(q + " -")
                         or (q and q in note) or (q and q in addr)):
                     return o
@@ -535,17 +538,28 @@ class ShalomReq(_Base):
 
 
 def _geo_status(order):
-    """Is this order's geo broken (needs a recycle fix)?"""
+    """Is this order's geo broken (needs a recycle fix)?
+
+    The resolved geo lives on the order's `shipping` object — NOT on
+    `orderDeliveries` (which is usually empty). districtCode is the source of
+    truth: in Peru it uniquely determines province+department (aliclik derives
+    the names downstream), so a present districtCode + no "No se encontró"
+    marker means the geo is valid.
+    """
+    ship = order.get("shipping") or {}
     delivery = (order.get("orderDeliveries") or [{}])[0] or {}
+    src = ship if (ship.get("districtCode") or ship.get("districtName")
+                   or ship.get("address1")) else delivery
     note = _norm(order.get("note"))
-    dep = delivery.get("departmentName")
-    prov = delivery.get("provinceName")
-    dist = delivery.get("districtName")
-    broken = ("NO SE ENCONTRO" in note) or not (dep and prov and dist)
+    dist_code = src.get("districtCode")
+    broken = ("NO SE ENCONTRO" in note) or not dist_code
     return {
         "broken": broken,
-        "address": delivery.get("address") or order.get("note"),
-        "department": dep, "province": prov, "district": dist,
+        "address": src.get("address1") or src.get("address") or order.get("note"),
+        "department": src.get("departmentName"),
+        "province": src.get("provinceName"),
+        "district": src.get("districtName"),
+        "districtCode": dist_code,
         "orderNumber": order.get("orderNumber"),
         "callStatus": order.get("callStatus"),
         "dispatchStatus": order.get("dispatchStatus"),
