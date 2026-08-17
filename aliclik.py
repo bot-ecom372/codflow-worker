@@ -150,18 +150,6 @@ class AliclikSession:
                 ],
                 viewport={"width": 1024, "height": 768},
             )
-            # Block heavy assets (images/media/fonts) to cut memory + speed up
-            # the 10MB SPA load on the small 512MB instance. Keep JS+CSS so the
-            # login form renders and the auth flow runs.
-            async def _block(route):
-                try:
-                    if route.request.resource_type in ("image", "media", "font"):
-                        await route.abort()
-                    else:
-                        await route.continue_()
-                except Exception:
-                    pass
-            await self._ctx.route("**/*", _block)
         self._page = self._ctx.pages[0] if self._ctx.pages else await self._ctx.new_page()
         p = self._page
 
