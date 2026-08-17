@@ -557,6 +557,10 @@ class ScreenshotReq(_Base):
     query: Optional[str] = None
 
 
+class DetailReq(_Base):
+    order_id: str
+
+
 @router.post("/whoami")
 async def whoami(req: _Base):
     _verify_secret(req.secret)
@@ -568,6 +572,12 @@ async def screenshot(req: ScreenshotReq):
     _verify_secret(req.secret)
     return await _session.screenshot(req.email, req.password,
                                      path=req.path, query=req.query)
+
+
+@router.post("/order-detail")
+async def order_detail(req: DetailReq):
+    _verify_secret(req.secret)
+    return await _session.deliveries(req.email, req.password, req.order_id)
 
 
 @router.post("/test-connection")
