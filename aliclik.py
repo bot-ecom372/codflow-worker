@@ -147,7 +147,6 @@ class AliclikSession:
                     "--disable-background-timer-throttling",
                     "--disable-renderer-backgrounding",
                     "--mute-audio",
-                    "--js-flags=--max-old-space-size=160",
                 ],
                 viewport={"width": 1024, "height": 768},
             )
@@ -184,7 +183,8 @@ class AliclikSession:
                                               timeout=20000)
                     await p.wait_for_selector("#basic_password", state="visible",
                                               timeout=20000)
-                except Exception:
+                except Exception as e:
+                    print(f"[aliclik] form not visible (url={p.url}): {e}", flush=True)
                     await p.wait_for_timeout(2000)
                     continue
                 await p.wait_for_timeout(1200)
@@ -192,13 +192,17 @@ class AliclikSession:
                     await p.fill("#basic_email", email, timeout=15000)
                     await p.fill("#basic_password", password, timeout=15000)
                     await p.click('button:has-text("Iniciar sesión")', timeout=15000)
-                except Exception:
+                    print("[aliclik] submitted credentials", flush=True)
+                except Exception as e:
+                    print(f"[aliclik] fill/submit failed: {e}", flush=True)
                     await p.wait_for_timeout(1500)
                     continue
                 try:
                     await p.wait_for_url(lambda u: "/login" not in u, timeout=15000)
+                    print(f"[aliclik] redirected to {p.url}", flush=True)
                     break
                 except Exception:
+                    print(f"[aliclik] no redirect after submit (still {p.url})", flush=True)
                     continue
             # Let the post-login SPA navigation settle so later evaluate() calls
             # don't hit a destroyed execution context.
