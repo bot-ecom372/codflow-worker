@@ -611,8 +611,17 @@ class AliclikSession:
                 "storeCentralProductId": d.get("storeCentralProductId"),
             })
         warehouse_id = o.get("warehouseId") or details[0].get("warehouseId") or -1
+        # Confirming an IMPORTED pre-order CREATES a new order — POST /order
+        # rejects a reused orderNumber ("ya existe"). aliclik generates
+        # companyPrefix + last-7-of-timestamp; derive the prefix by stripping
+        # the CodFlow number suffix off the pre-order's number.
+        q_digits = "".join(ch for ch in str(order_query) if ch.isdigit())
+        onum = o.get("orderNumber") or ""
+        prefix = onum[:-len(q_digits)] if (q_digits and onum.endswith(q_digits)) \
+            else "BESH15X"
+        new_number = f"{prefix}{str(int(datetime.utcnow().timestamp() * 1000))[-7:]}"
         payload = {
-            "orderNumber": o.get("orderNumber"),
+            "orderNumber": new_number,
             "agencyUbigeoId": None,
             "userId": who["userId"],
             "total": amt,
