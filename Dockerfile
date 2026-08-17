@@ -7,6 +7,6 @@ RUN pip install --no-cache-dir -r requirements.txt && \
     playwright install --with-deps chromium && \
     rm -rf /var/lib/apt/lists/* /tmp/*
 
-COPY main.py .
+COPY main.py aliclik.py .
 
 CMD uvicorn main:app --host 0.0.0.0 --port ${PORT:-10000}

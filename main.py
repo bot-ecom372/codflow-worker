@@ -44,6 +44,10 @@ _sessions: dict[str, requests.Session] = {}
 
 WORKER_SECRET = os.getenv("WORKER_SECRET", "codflow-worker-2026")
 
+# Aliclik integration (Peru COD platform) — warm Playwright page + API bridge.
+from aliclik import router as aliclik_router  # noqa: E402
+app.include_router(aliclik_router)
+
 
 # ═══════════════════════════════════════════
 # MODELS
@@ -392,7 +396,7 @@ def _fetch_tracking(session: requests.Session, base_url: str, days_back: int = 1
 
 @app.get("/")
 def health():
-    return {"status": "ok", "service": "codflow-worker", "version": "1.1.0"}
+    return {"status": "ok", "service": "codflow-worker", "version": "1.3.0-aliclik"}
 
 
 @app.post("/test-connection")
