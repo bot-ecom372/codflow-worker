@@ -675,7 +675,7 @@ class AliclikSession:
             "currency": cur,
             "isOrderAgency": False,
             "trackingStatus": o.get("trackingStatus"),
-            "paymentType": o.get("paymentType"),
+            "paymentType": o.get("paymentType") or "COD",
             "shippingCost": ship_cost,
             "managementType": o.get("managementType"),
             "payAgency": o.get("payAgency"),
@@ -852,6 +852,8 @@ class DetailReq(_Base):
 class RawReq(_Base):
     path: str
     params: Optional[dict] = None
+    method: str = "GET"
+    data: Optional[dict] = None
 
 
 @router.post("/whoami")
@@ -875,10 +877,11 @@ async def order_detail(req: DetailReq):
 
 @router.post("/raw")
 async def raw(req: RawReq):
-    """Read-only GET passthrough for reconnaissance (build the confirm flow)."""
+    """API passthrough for reconnaissance / payload iteration."""
     _verify_secret(req.secret)
     st, body = await _session.api_json(req.email, req.password, req.path,
-                                       params=req.params)
+                                       method=req.method, params=req.params,
+                                       data=req.data)
     return {"status": st, "body": body}
 
 
