@@ -3,6 +3,7 @@ set -e
 
 pip install -r requirements.txt
 
-# Install Chromium for Playwright
-# Try with system deps first (needs apt), fallback to browser-only
-playwright install --with-deps chromium 2>/dev/null || playwright install chromium
+# Install Chromium (headless shell) using the venv's playwright, deterministically.
+# --with-deps needs root (harmless no-op on Render native); fall back to
+# browser-only download so the binary is always present.
+python -m playwright install --with-deps chromium || python -m playwright install chromium

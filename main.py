@@ -569,13 +569,21 @@ _session_started_at: float = 0
 @app.on_event("startup")
 async def _launch_browser():
     global _browser, _playwright_instance
-    from playwright.async_api import async_playwright
-    _playwright_instance = await async_playwright().start()
-    _browser = await _playwright_instance.chromium.launch(
-        headless=True,
-        args=["--disable-blink-features=AutomationControlled", "--no-sandbox", "--disable-dev-shm-usage"],
-    )
-    print("[Sessions] Browser launched at startup")
+    # Non-fatal: if Chromium can't launch (e.g. browser not installed or missing
+    # system libs), the worker must still boot so the non-browser endpoints
+    # (Spedisci upload/tracking, aliclik dry-run) keep working. Browser-backed
+    # endpoints launch lazily and surface their own error.
+    try:
+        from playwright.async_api import async_playwright
+        _playwright_instance = await async_playwright().start()
+        _browser = await _playwright_instance.chromium.launch(
+            headless=True,
+            args=["--disable-blink-features=AutomationControlled", "--no-sandbox", "--disable-dev-shm-usage"],
+        )
+        print("[Sessions] Browser launched at startup")
+    except Exception as e:
+        _browser = None
+        print(f"[Sessions] Browser launch skipped at startup: {e}")
 
 
 @app.on_event("shutdown")
