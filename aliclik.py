@@ -55,6 +55,9 @@ ALICLIK_API = "https://aliclik-api-release-f6985904c9e2.herokuapp.com"
 ADMIN = "https://admin.aliclik.app"
 WORKER_SECRET = os.getenv("WORKER_SECRET", "codflow-worker-2026")
 UDATA_DIR = os.getenv("ALICLIK_UDATA", "/tmp/aliclik-udata")
+# aliclik's own Google Maps key (referrer-locked to their domain → only usable
+# from inside an aliclik.app page). Overridable with a server-side key via env.
+_GMAPS_KEY = os.getenv("GMAPS_KEY", "AIzaSyDfqPYsPuygRlXodTtPpNxn_h6N3-IvVTw")
 
 router = APIRouter(prefix="/aliclik", tags=["aliclik"])
 
@@ -278,19 +281,51 @@ class AliclikSession:
             await self._ensure(email, password)
             return await self._eval(_WHOAMI_JS)
 
-    async def _geocode(self, query):
-        """Address -> 'lat,lng' via OpenStreetMap Nominatim (free, no key).
-        Mirrors the operator's 'Confirmar ubicación'. Returns None on failure."""
+    async def _geocode(self, email, password, query):
+        """Address -> 'lat,lng'. Uses Google Maps loaded INSIDE the aliclik page
+        (their key is referrer-locked to aliclik.app, so it only works in-browser
+        — exactly what the operator's 'Confirmar ubicación' does). Falls back to
+        Photon (datacenter-friendly OSM geocoder). Returns None on failure."""
+        async with self._lock:
+            await self._ensure(email, password)
+            try:
+                res = await self._page.evaluate(
+                    """async ({query, key}) => {
+                        if (!(window.google && window.google.maps)) {
+                            await new Promise((ok, no) => {
+                                const s = document.createElement('script');
+                                s.src = 'https://maps.googleapis.com/maps/api/js?key=' + key;
+                                s.onload = ok; s.onerror = no;
+                                document.head.appendChild(s);
+                            }).catch(() => {});
+                            for (let i=0;i<80 && !(window.google&&window.google.maps);i++)
+                                await new Promise(r=>setTimeout(r,100));
+                        }
+                        if (!(window.google && window.google.maps)) return null;
+                        return await new Promise(res => {
+                            new google.maps.Geocoder().geocode({address: query},
+                              (r, st) => {
+                                if (st==='OK' && r && r[0]) {
+                                    const l=r[0].geometry.location;
+                                    res(l.lat()+','+l.lng());
+                                } else res(null);
+                              });
+                        });
+                    }""",
+                    {"query": query, "key": _GMAPS_KEY})
+                if res:
+                    return res
+            except Exception:
+                pass
+        # fallback: Photon (allows datacenter IPs, unlike Nominatim)
         try:
             async with httpx.AsyncClient(timeout=15) as c:
-                r = await c.get(
-                    "https://nominatim.openstreetmap.org/search",
-                    params={"q": query, "format": "json", "limit": 1,
-                            "countrycodes": "pe"},
-                    headers={"User-Agent": "codflow-worker/1.0"})
-                arr = r.json()
-                if arr:
-                    return f"{arr[0]['lat']},{arr[0]['lon']}"
+                r = await c.get("https://photon.komoot.io/api/",
+                                params={"q": query, "limit": 1})
+                feats = (r.json() or {}).get("features") or []
+                if feats:
+                    lon, lat = feats[0]["geometry"]["coordinates"]
+                    return f"{lat},{lon}"
         except Exception:
             pass
         return None
@@ -523,8 +558,10 @@ class AliclikSession:
         # geocode the address (like the operator's "Confirmar ubicación").
         gps = gps or sh.get("gps")
         if not gps or gps in ("0,0", "0", ",", "0.0,0.0"):
-            gps = await self._geocode(f"{address}, {district}, {province}, Peru") \
-                or await self._geocode(f"{district}, {province}, Peru") or "0,0"
+            gps = await self._geocode(email, password,
+                                      f"{address}, {district}, {province}, Peru") \
+                or await self._geocode(email, password,
+                                       f"{district}, {province}, Lima, Peru") or "0,0"
         lat, _, lng = gps.partition(",")
         parts = (customer_name or "").split()
         first = parts[0] if parts else ""
