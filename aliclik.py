@@ -224,20 +224,25 @@ class AliclikSession:
             await p.wait_for_timeout(1300)
         return None
 
+    _RETRYABLE = ("context was destroyed", "Execution context",
+                  "Failed to fetch", "NetworkError", "net::", "ERR_",
+                  "Target closed", "detached")
+
     async def _eval(self, js, arg="__none__"):
-        """page.evaluate with a retry on transient navigation teardown."""
-        for attempt in range(3):
+        """page.evaluate with a retry on transient navigation/network errors."""
+        for attempt in range(4):
             try:
                 if arg == "__none__":
                     return await self._page.evaluate(js)
                 return await self._page.evaluate(js, arg)
             except Exception as e:
-                if "context was destroyed" in str(e) or "Execution context" in str(e):
+                msg = str(e)
+                if any(k in msg for k in self._RETRYABLE):
                     try:
                         await self._page.wait_for_load_state("networkidle", timeout=10000)
                     except Exception:
                         pass
-                    await self._page.wait_for_timeout(1200)
+                    await self._page.wait_for_timeout(1500)
                     continue
                 raise
         # last try, let it raise if still broken
