@@ -282,44 +282,12 @@ class AliclikSession:
             return await self._eval(_WHOAMI_JS)
 
     async def _geocode(self, email, password, query):
-        """Address -> 'lat,lng'. Uses Google Maps loaded INSIDE the aliclik page
-        (their key is referrer-locked to aliclik.app, so it only works in-browser
-        — exactly what the operator's 'Confirmar ubicación' does). Falls back to
-        Photon (datacenter-friendly OSM geocoder). Returns None on failure."""
-        async with self._lock:
-            await self._ensure(email, password)
-            try:
-                res = await self._page.evaluate(
-                    """async ({query, key}) => {
-                        if (!(window.google && window.google.maps)) {
-                            await new Promise((ok, no) => {
-                                const s = document.createElement('script');
-                                s.src = 'https://maps.googleapis.com/maps/api/js?key=' + key;
-                                s.onload = ok; s.onerror = no;
-                                document.head.appendChild(s);
-                            }).catch(() => {});
-                            for (let i=0;i<80 && !(window.google&&window.google.maps);i++)
-                                await new Promise(r=>setTimeout(r,100));
-                        }
-                        if (!(window.google && window.google.maps)) return null;
-                        return await new Promise(res => {
-                            new google.maps.Geocoder().geocode({address: query},
-                              (r, st) => {
-                                if (st==='OK' && r && r[0]) {
-                                    const l=r[0].geometry.location;
-                                    res(l.lat()+','+l.lng());
-                                } else res(null);
-                              });
-                        });
-                    }""",
-                    {"query": query, "key": _GMAPS_KEY})
-                if res:
-                    return res
-            except Exception:
-                pass
-        # fallback: Photon (allows datacenter IPs, unlike Nominatim)
+        """Address -> 'lat,lng' via Photon (OSM, datacenter-friendly — verified
+        working from Render), Nominatim as fallback. email/password are unused
+        (kept for call-site compatibility). Returns None on failure."""
+        headers = {"User-Agent": "codflow-worker/1.0"}
         try:
-            async with httpx.AsyncClient(timeout=15) as c:
+            async with httpx.AsyncClient(timeout=15, headers=headers) as c:
                 r = await c.get("https://photon.komoot.io/api/",
                                 params={"q": query, "limit": 1})
                 feats = (r.json() or {}).get("features") or []
@@ -328,25 +296,16 @@ class AliclikSession:
                     return f"{lat},{lon}"
         except Exception:
             pass
-        return None
-
-    async def _geocode_via_recycle(self, email, password, *, order_id, name,
-                                   address, district_code, district_name,
-                                   phone, reference=""):
-        """Reuse aliclik's OWN geocoding: the recycle endpoint geocodes
-        address1+district server-side and returns the resolved gps. Returns
-        'lat,lng' or None. This is a write (sets the address/district)."""
-        parts = (name or "").split()
-        rec = await self.fix_address(
-            email, password, order_id=order_id, name=parts[0] if parts else name,
-            last_name=" ".join(parts[1:]) if len(parts) > 1 else "",
-            address=address, reference=reference, district_code=district_code,
-            district_name=district_name, phone=phone, dry_run=False)
-        resp = rec.get("response")
-        if isinstance(resp, dict):
-            g = resp.get("gps")
-            if g and g.replace(" ", "") not in ("0,0", "0", ",", "0.0,0.0"):
-                return g
+        try:
+            async with httpx.AsyncClient(timeout=15, headers=headers) as c:
+                r = await c.get("https://nominatim.openstreetmap.org/search",
+                                params={"q": query, "format": "json",
+                                        "limit": 1, "countrycodes": "pe"})
+                arr = r.json()
+                if arr:
+                    return f"{arr[0]['lat']},{arr[0]['lon']}"
+        except Exception:
+            pass
         return None
 
     async def screenshot(self, email, password, path="/order/orders", query=None):
@@ -577,25 +536,18 @@ class AliclikSession:
         first = parts[0] if parts else ""
         last = " ".join(parts[1:]) if len(parts) > 1 else ""
         phone = str(customer_phone or sh.get("senderPhone") or "")
-        # GPS: ALIDRIVER requires it. External geocoders (Nominatim/Google/Photon)
-        # are IP-blocked from the datacenter — so reuse aliclik's OWN server-side
-        # geocoding: PATCH /order/recycle/customer-address geocodes address1 +
-        # district and returns the resolved gps. This also does the operator's
-        # "borra la nota / verifica dirección" step. `_geocode_via_recycle`
-        # is a write; it sets the very address/district the confirm re-sends.
+        # GPS: ALIDRIVER requires it. Geocode the address via Photon (works from
+        # the datacenter) — full address first, then district-level fallback.
         def _bad(g):
-            return (not g) or g.replace(" ", "") in ("0,0", "0", ",", "0.0,0.0", "0.0,0.0")
+            return (not g) or g.replace(" ", "") in ("0,0", "0", ",", "0.0,0.0")
         gps = gps or sh.get("gps")
-        if _bad(gps):
-            gps = await self._geocode_via_recycle(
-                email, password, order_id=str(o.get("id")),
-                name=customer_name, address=address, reference=reference,
-                district_code=geo["districtCode"],
-                district_name=geo["districtName"], phone=phone) or gps
         if _bad(gps):
             gps = await self._geocode(
                 email, password,
-                f"{address}, {district}, {province}, Lima, Peru") or "0,0"
+                f"{address}, {district}, {province}, Lima, Peru") \
+                or await self._geocode(
+                    email, password, f"{district}, {province}, Lima, Peru") \
+                or "0,0"
         lat, _, lng = gps.partition(",")
         if dispatch_date:
             disp = dispatch_date
