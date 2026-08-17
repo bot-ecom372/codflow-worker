@@ -271,6 +271,47 @@ class AliclikSession:
             await self._ensure(email, password)
             return await self._eval(_WHOAMI_JS)
 
+    async def screenshot(self, email, password, path="/order/orders", query=None):
+        """Navigate the aliclik admin UI and capture PNG screenshots (base64).
+        Debug/demo helper — shows the real order on aliclik. Does NOT save."""
+        import base64
+        async with self._lock:
+            await self._ensure(email, password)
+            p = self._page
+            out = {}
+            try:
+                await p.goto(ADMIN + path, wait_until="domcontentloaded", timeout=30000)
+                await p.wait_for_timeout(7000)
+            except Exception as e:
+                out["nav_error"] = str(e)[:200]
+            out["url"] = p.url
+            try:
+                out["page_b64"] = base64.b64encode(await p.screenshot(full_page=True)).decode()
+            except Exception as e:
+                out["shot_error"] = str(e)[:200]
+            if query and "/login" not in p.url:
+                try:
+                    si = await p.query_selector(
+                        "input[placeholder*='Buscar'], input[placeholder*='buscar'], .ant-input")
+                    if si:
+                        await si.fill(query)
+                        await si.press("Enter")
+                        await p.wait_for_timeout(4500)
+                    await p.evaluate(
+                        "() => { const r=document.querySelector('tbody tr');"
+                        " if(r){ (r.querySelector('a,button')||r).click(); } }")
+                    await p.wait_for_timeout(4000)
+                    out["detail_b64"] = base64.b64encode(
+                        await p.screenshot(full_page=True)).decode()
+                    out["detail_info"] = await p.evaluate(
+                        "() => ({ drawer: !!document.querySelector('.ant-drawer,.ant-modal'),"
+                        " selects: document.querySelectorAll('.ant-select').length,"
+                        " labels: [...document.querySelectorAll('.ant-form-item-label label,label')]"
+                        ".map(l=>l.textContent.trim()).filter(Boolean).slice(0,30) })")
+                except Exception as e:
+                    out["detail_error"] = str(e)[:200]
+            return out
+
     # ── geo ──────────────────────────────────────────────────────────────
     async def _ubigeo(self, email, password, country, nivel, parent_id):
         st, body = await self.api_json(
@@ -504,10 +545,22 @@ def _geo_status(order):
     }
 
 
+class ScreenshotReq(_Base):
+    path: str = "/order/orders"
+    query: Optional[str] = None
+
+
 @router.post("/whoami")
 async def whoami(req: _Base):
     _verify_secret(req.secret)
     return await _session.whoami(req.email, req.password)
+
+
+@router.post("/screenshot")
+async def screenshot(req: ScreenshotReq):
+    _verify_secret(req.secret)
+    return await _session.screenshot(req.email, req.password,
+                                     path=req.path, query=req.query)
 
 
 @router.post("/test-connection")
