@@ -575,6 +575,11 @@ class DetailReq(_Base):
     order_id: str
 
 
+class RawReq(_Base):
+    path: str
+    params: Optional[dict] = None
+
+
 @router.post("/whoami")
 async def whoami(req: _Base):
     _verify_secret(req.secret)
@@ -592,6 +597,15 @@ async def screenshot(req: ScreenshotReq):
 async def order_detail(req: DetailReq):
     _verify_secret(req.secret)
     return await _session.deliveries(req.email, req.password, req.order_id)
+
+
+@router.post("/raw")
+async def raw(req: RawReq):
+    """Read-only GET passthrough for reconnaissance (build the confirm flow)."""
+    _verify_secret(req.secret)
+    st, body = await _session.api_json(req.email, req.password, req.path,
+                                       params=req.params)
+    return {"status": st, "body": body}
 
 
 @router.post("/test-connection")
