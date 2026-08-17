@@ -330,6 +330,25 @@ class AliclikSession:
             pass
         return None
 
+    async def _geocode_via_recycle(self, email, password, *, order_id, name,
+                                   address, district_code, district_name,
+                                   phone, reference=""):
+        """Reuse aliclik's OWN geocoding: the recycle endpoint geocodes
+        address1+district server-side and returns the resolved gps. Returns
+        'lat,lng' or None. This is a write (sets the address/district)."""
+        parts = (name or "").split()
+        rec = await self.fix_address(
+            email, password, order_id=order_id, name=parts[0] if parts else name,
+            last_name=" ".join(parts[1:]) if len(parts) > 1 else "",
+            address=address, reference=reference, district_code=district_code,
+            district_name=district_name, phone=phone, dry_run=False)
+        resp = rec.get("response")
+        if isinstance(resp, dict):
+            g = resp.get("gps")
+            if g and g.replace(" ", "") not in ("0,0", "0", ",", "0.0,0.0"):
+                return g
+        return None
+
     async def screenshot(self, email, password, path="/order/orders", query=None):
         """Navigate the aliclik admin UI and capture PNG screenshots (base64).
         Debug/demo helper — shows the real order on aliclik. Does NOT save."""
@@ -554,19 +573,30 @@ class AliclikSession:
         if not details:
             raise HTTPException(status_code=400,
                                 detail="order has no product details (skuId) to confirm")
-        # GPS: ALIDRIVER requires it. Use provided → existing order gps →
-        # geocode the address (like the operator's "Confirmar ubicación").
-        gps = gps or sh.get("gps")
-        if not gps or gps in ("0,0", "0", ",", "0.0,0.0"):
-            gps = await self._geocode(email, password,
-                                      f"{address}, {district}, {province}, Peru") \
-                or await self._geocode(email, password,
-                                       f"{district}, {province}, Lima, Peru") or "0,0"
-        lat, _, lng = gps.partition(",")
         parts = (customer_name or "").split()
         first = parts[0] if parts else ""
         last = " ".join(parts[1:]) if len(parts) > 1 else ""
         phone = str(customer_phone or sh.get("senderPhone") or "")
+        # GPS: ALIDRIVER requires it. External geocoders (Nominatim/Google/Photon)
+        # are IP-blocked from the datacenter — so reuse aliclik's OWN server-side
+        # geocoding: PATCH /order/recycle/customer-address geocodes address1 +
+        # district and returns the resolved gps. This also does the operator's
+        # "borra la nota / verifica dirección" step. `_geocode_via_recycle`
+        # is a write; it sets the very address/district the confirm re-sends.
+        def _bad(g):
+            return (not g) or g.replace(" ", "") in ("0,0", "0", ",", "0.0,0.0", "0.0,0.0")
+        gps = gps or sh.get("gps")
+        if _bad(gps):
+            gps = await self._geocode_via_recycle(
+                email, password, order_id=str(o.get("id")),
+                name=customer_name, address=address, reference=reference,
+                district_code=geo["districtCode"],
+                district_name=geo["districtName"], phone=phone) or gps
+        if _bad(gps):
+            gps = await self._geocode(
+                email, password,
+                f"{address}, {district}, {province}, Lima, Peru") or "0,0"
+        lat, _, lng = gps.partition(",")
         if dispatch_date:
             disp = dispatch_date
         else:
