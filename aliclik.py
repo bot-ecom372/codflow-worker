@@ -156,7 +156,7 @@ class AliclikSession:
 
         await p.goto(ADMIN + "/", wait_until="domcontentloaded", timeout=45000)
         await p.wait_for_timeout(2500)
-        tok = await p.evaluate("() => localStorage.getItem('ALP_AuthToken')")
+        tok = await self._read_token(p, wait_for_token=False)
         if not tok or "/login" in p.url:
             for _ in range(6):
                 # Avoid a redundant re-navigation when goto('/') already
@@ -194,10 +194,28 @@ class AliclikSession:
             except Exception:
                 pass
             await p.wait_for_timeout(1500)
-        tok = await p.evaluate("() => localStorage.getItem('ALP_AuthToken')")
+        tok = await self._read_token(p, wait_for_token=True)
         if not tok:
             raise HTTPException(status_code=502, detail="Aliclik login failed (no token)")
         self._email = email
+
+    async def _read_token(self, p, wait_for_token=False):
+        """Read the JWT from localStorage, tolerating the post-login redirect
+        chain that repeatedly tears down the execution context. When
+        wait_for_token is True we poll until it appears (we just logged in);
+        otherwise we do a quick tolerant probe (may legitimately be None)."""
+        attempts = 12 if wait_for_token else 2
+        for _ in range(attempts):
+            try:
+                tok = await p.evaluate("() => localStorage.getItem('ALP_AuthToken')")
+                if tok:
+                    return tok
+                if not wait_for_token:
+                    return None
+            except Exception:
+                pass
+            await p.wait_for_timeout(1300)
+        return None
 
     async def _eval(self, js, arg="__none__"):
         """page.evaluate with a retry on transient navigation teardown."""
