@@ -46,6 +46,8 @@ import unicodedata
 from datetime import datetime, timedelta
 from typing import Optional
 
+import httpx
+
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
@@ -276,6 +278,23 @@ class AliclikSession:
             await self._ensure(email, password)
             return await self._eval(_WHOAMI_JS)
 
+    async def _geocode(self, query):
+        """Address -> 'lat,lng' via OpenStreetMap Nominatim (free, no key).
+        Mirrors the operator's 'Confirmar ubicación'. Returns None on failure."""
+        try:
+            async with httpx.AsyncClient(timeout=15) as c:
+                r = await c.get(
+                    "https://nominatim.openstreetmap.org/search",
+                    params={"q": query, "format": "json", "limit": 1,
+                            "countrycodes": "pe"},
+                    headers={"User-Agent": "codflow-worker/1.0"})
+                arr = r.json()
+                if arr:
+                    return f"{arr[0]['lat']},{arr[0]['lon']}"
+        except Exception:
+            pass
+        return None
+
     async def screenshot(self, email, password, path="/order/orders", query=None):
         """Navigate the aliclik admin UI and capture PNG screenshots (base64).
         Debug/demo helper — shows the real order on aliclik. Does NOT save."""
@@ -500,7 +519,12 @@ class AliclikSession:
         if not details:
             raise HTTPException(status_code=400,
                                 detail="order has no product details (skuId) to confirm")
-        gps = gps or sh.get("gps") or "0,0"
+        # GPS: ALIDRIVER requires it. Use provided → existing order gps →
+        # geocode the address (like the operator's "Confirmar ubicación").
+        gps = gps or sh.get("gps")
+        if not gps or gps in ("0,0", "0", ",", "0.0,0.0"):
+            gps = await self._geocode(f"{address}, {district}, {province}, Peru") \
+                or await self._geocode(f"{district}, {province}, Peru") or "0,0"
         lat, _, lng = gps.partition(",")
         parts = (customer_name or "").split()
         first = parts[0] if parts else ""
@@ -510,17 +534,19 @@ class AliclikSession:
             disp = dispatch_date
         else:
             disp = datetime.utcnow().strftime("%Y-%m-%dT00:00:00.000Z")
-        qty = int(quantity) if quantity else (details[0].get("quantity") or 1)
+        # Preserve the real product line (skuId/price/subtotal from the Shopify
+        # import) — only the display name (productDetail) and the COD total are
+        # set from the given data.
+        line_qty = details[0].get("quantity") or int(quantity or 1)
         amt = float(amount) if amount is not None else (o.get("total") or 0)
-        unit = round(amt / qty, 2) if qty else amt
         cur = o.get("currency")
         cur = cur.get("code") if isinstance(cur, dict) else (cur or "PEN")
         od = []
         for d in details:
             od.append({
-                "price": unit if len(details) == 1 else d.get("price"),
-                "quantity": qty if len(details) == 1 else d.get("quantity"),
-                "subtotal": amt if len(details) == 1 else d.get("subtotal"),
+                "price": d.get("price"),
+                "quantity": d.get("quantity"),
+                "subtotal": d.get("subtotal"),
                 "skuId": d.get("skuId"),
                 "warehouseId": d.get("warehouseId"),
                 "companyId": d.get("companyId"),
@@ -551,7 +577,7 @@ class AliclikSession:
             "paymentType": o.get("paymentType"),
             "shippingCost": sh.get("shippingCost") or 0,
             "managementType": o.get("managementType"),
-            "productDetail": f"{qty} {product_name}",
+            "productDetail": f"{line_qty} {product_name}",
             "warehouseName": o.get("warehouseName"),
             "warehouseId": warehouse_id,
             "createdAtShopify": o.get("createdAtShopify"),
