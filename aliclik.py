@@ -477,6 +477,117 @@ class AliclikSession:
             items = [x for x in items if c in _norm(x.get("name"))]
         return items
 
+    async def confirm_order(self, email, password, *, order_query,
+                            customer_name, customer_phone, address,
+                            department, province, district, product_name,
+                            quantity, amount, reference="", gps=None,
+                            transport_id=1, dispatch_date=None, dry_run=True):
+        """Replicate the operator's full 'Guardar' → POST /order that turns an
+        IMPORTED pre-order into a CONFIRMED order ready for dispatch. Builds the
+        whole payload from the existing order + the given (CodFlow) data + rules
+        (courier=ALIDRIVER id 1, dispatch date=today). dry_run returns the
+        payload WITHOUT posting so it can be reviewed first."""
+        o = await self.find_order(email, password, order_query)
+        if not o:
+            raise HTTPException(status_code=404, detail="order not found on aliclik")
+        who = await self.whoami(email, password)
+        geo = await self.resolve_geo(email, password, district=district,
+                                     province=province, department=department)
+        if not geo:
+            raise HTTPException(status_code=404, detail="could not resolve geo")
+        sh = o.get("shipping") or {}
+        details = o.get("orderDetails") or []
+        if not details:
+            raise HTTPException(status_code=400,
+                                detail="order has no product details (skuId) to confirm")
+        gps = gps or sh.get("gps") or "0,0"
+        lat, _, lng = gps.partition(",")
+        parts = (customer_name or "").split()
+        first = parts[0] if parts else ""
+        last = " ".join(parts[1:]) if len(parts) > 1 else ""
+        phone = str(customer_phone or sh.get("senderPhone") or "")
+        if dispatch_date:
+            disp = dispatch_date
+        else:
+            disp = datetime.utcnow().strftime("%Y-%m-%dT00:00:00.000Z")
+        qty = int(quantity) if quantity else (details[0].get("quantity") or 1)
+        amt = float(amount) if amount is not None else (o.get("total") or 0)
+        unit = round(amt / qty, 2) if qty else amt
+        cur = o.get("currency")
+        cur = cur.get("code") if isinstance(cur, dict) else (cur or "PEN")
+        od = []
+        for d in details:
+            od.append({
+                "price": unit if len(details) == 1 else d.get("price"),
+                "quantity": qty if len(details) == 1 else d.get("quantity"),
+                "subtotal": amt if len(details) == 1 else d.get("subtotal"),
+                "skuId": d.get("skuId"),
+                "warehouseId": d.get("warehouseId"),
+                "companyId": d.get("companyId"),
+                "dropPrice": d.get("dropPrice"),
+                "storeCentralProductId": d.get("storeCentralProductId"),
+            })
+        warehouse_id = o.get("warehouseId") or details[0].get("warehouseId") or -1
+        payload = {
+            "orderNumber": o.get("orderNumber"),
+            "agencyUbigeoId": None,
+            "userId": who["userId"],
+            "total": amt,
+            "prefixPhone": o.get("prefixPhone") or "+51",
+            "forceCreateIfTwin": None,
+            "confirmationGps": gps,
+            "note": "",
+            "channel": o.get("channel") or "Shopify",
+            "status": o.get("status"),
+            "commissionCod": o.get("commissionCod"),
+            "reason": "",
+            "callStatus": "CONFIRMED",
+            "subStatus": o.get("subStatus"),
+            "flagDeliveryExpress": o.get("flagDeliveryExpress"),
+            "additionalCostExpress": 0,
+            "currency": cur,
+            "isOrderAgency": False,
+            "trackingStatus": o.get("trackingStatus"),
+            "paymentType": o.get("paymentType"),
+            "shippingCost": sh.get("shippingCost") or 0,
+            "managementType": o.get("managementType"),
+            "productDetail": f"{qty} {product_name}",
+            "warehouseName": o.get("warehouseName"),
+            "warehouseId": warehouse_id,
+            "createdAtShopify": o.get("createdAtShopify"),
+            "transportId": transport_id,
+            "customer": {"companyId": who["companyId"], "name": customer_name,
+                         "lastName": "", "phone": phone},
+            "orderDetails": od,
+            "preOrderHistory": {},
+            "shipping": {
+                "id": sh.get("id"),
+                "operationCode": sh.get("operationCode"),
+                "address1": address, "address2": "", "reference": reference,
+                "lat": lat.strip() or "0", "lng": lng.strip() or "0",
+                "firstName": first, "firstLastName": last, "secondLastName": "",
+                "countryCode": "PER",
+                "departmentName": geo["departmentName"],
+                "departmentCode": str(geo["departmentCode"]),
+                "provinceName": geo["provinceName"],
+                "provinceCode": str(geo["provinceCode"]),
+                "districtName": geo["districtName"],
+                "districtCode": str(geo["districtCode"]),
+                "postalCode": None,
+                "scheduleDate": disp, "dispatchDate": disp,
+                "shippingByAgency": False,
+                "shippingCost": sh.get("shippingCost") or 0,
+                "senderPhone": phone,
+            },
+        }
+        if dry_run:
+            return {"dry_run": True, "order_id": o.get("id"),
+                    "orderNumber": o.get("orderNumber"), "payload": payload}
+        st, body = await self.api_json(email, password, "/order",
+                                       method="POST", data=payload)
+        return {"dry_run": False, "status": st, "order_id": o.get("id"),
+                "response": body, "payload": payload}
+
 
 _session = AliclikSession()
 
@@ -535,6 +646,24 @@ class NoteReq(_Base):
 
 class ShalomReq(_Base):
     contains: Optional[str] = None
+
+
+class ConfirmReq(_Base):
+    order_query: str
+    customer_name: str
+    customer_phone: str
+    address: str
+    reference: str = ""
+    department: str
+    province: str
+    district: str
+    product_name: str
+    quantity: int = 1
+    amount: Optional[float] = None
+    gps: Optional[str] = None
+    transport_id: int = 1          # 1 = ALIDRIVER
+    dispatch_date: Optional[str] = None
+    dry_run: bool = True
 
 
 def _geo_status(order):
@@ -693,3 +822,16 @@ async def note(req: NoteReq):
 async def shalom_agencies(req: ShalomReq):
     _verify_secret(req.secret)
     return await _session.shalom_agencies(req.email, req.password, contains=req.contains)
+
+
+@router.post("/confirm-order")
+async def confirm_order(req: ConfirmReq):
+    _verify_secret(req.secret)
+    return await _session.confirm_order(
+        req.email, req.password, order_query=req.order_query,
+        customer_name=req.customer_name, customer_phone=req.customer_phone,
+        address=req.address, reference=req.reference, department=req.department,
+        province=req.province, district=req.district,
+        product_name=req.product_name, quantity=req.quantity, amount=req.amount,
+        gps=req.gps, transport_id=req.transport_id,
+        dispatch_date=req.dispatch_date, dry_run=req.dry_run)
