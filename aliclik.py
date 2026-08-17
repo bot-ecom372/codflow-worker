@@ -93,9 +93,14 @@ _API_JS = """async (a) => {
     'Content-Type': 'application/json',
   }};
   if (a.data) opts.body = JSON.stringify(a.data);
-  const r = await fetch(u, opts);
-  const t = await r.text();
-  return { status: r.status, body: t };
+  try {
+    const r = await fetch(u, opts);
+    const t = await r.text();
+    return { status: r.status, body: t };
+  } catch (e) {
+    // network / CORS / dead-session error — signal for a relogin+retry
+    return { status: 0, body: 'fetch-failed: ' + String(e) };
+  }
 }"""
 
 _WHOAMI_JS = """() => {
@@ -259,16 +264,38 @@ class AliclikSession:
 
     async def api(self, email, password, path, method="GET", params=None, data=None):
         async with self._lock:
-            await self._ensure(email, password)
-            # stringify param values (URLSearchParams wants strings)
+            p = None
             if params:
-                params = {k: ("" if v is None else str(v)) for k, v in params.items()}
-            res = await self._eval(
-                _API_JS,
-                {"base": ALICLIK_API, "path": path, "method": method,
-                 "params": params, "data": data},
-            )
+                p = {k: ("" if v is None else str(v)) for k, v in params.items()}
+            for attempt in range(3):
+                await self._ensure(email, password)
+                res = await self._eval(
+                    _API_JS,
+                    {"base": ALICLIK_API, "path": path, "method": method,
+                     "params": p, "data": data},
+                )
+                # status 0 = network/dead-session fetch failure → rebuild the
+                # whole context (fresh login) and retry.
+                if isinstance(res, dict) and res.get("status") == 0 and attempt < 2:
+                    print(f"[aliclik] {method} {path} net-fail (att {attempt+1}), "
+                          "rebuilding session", flush=True)
+                    await self._reset_session()
+                    await asyncio.sleep(1.5)
+                    continue
+                return res
             return res
+
+    async def _reset_session(self):
+        """Tear down the browser context so the next call logs in fresh."""
+        try:
+            if self._ctx:
+                await self._ctx.close()
+        except Exception:
+            pass
+        self._ctx = None
+        self._page = None
+        self._who = None
+        self._email = None
 
     async def api_json(self, *a, **k):
         res = await self.api(*a, **k)
@@ -699,8 +726,10 @@ class AliclikSession:
         if dry_run:
             return {"dry_run": True, "order_id": o.get("id"),
                     "orderNumber": o.get("orderNumber"), "payload": payload}
+        print(f"[aliclik] confirm POST /order {new_number} (gps={gps})", flush=True)
         st, body = await self.api_json(email, password, "/order",
                                        method="POST", data=payload)
+        print(f"[aliclik] confirm POST /order -> {st}", flush=True)
         return {"dry_run": False, "status": st, "order_id": o.get("id"),
                 "response": body, "payload": payload}
 
