@@ -424,16 +424,31 @@ class AliclikSession:
         return None
 
     # ── orders ───────────────────────────────────────────────────────────
+    @staticmethod
+    def _order_matches(o, q):
+        delivery = (o.get("orderDeliveries") or [{}])[0] or {}
+        ship = o.get("shipping") or {}
+        num = _norm(o.get("orderNumber"))
+        note = _norm(o.get("note"))
+        addr = _norm(delivery.get("address") or ship.get("address1"))
+        # aliclik orderNumber is "<prefix><orderNumber>" (e.g. BESH15X2561):
+        # match the CodFlow number as a suffix. Note may have been cleared, so
+        # the orderNumber suffix is the reliable key.
+        return (num == q or num.endswith(q) or note == q
+                or note.startswith(q + " ") or note.startswith(q + " -")
+                or (q and q in note) or (q and q in addr))
+
     async def find_order(self, email, password, query, start=None, end=None,
-                         max_pages=2, page_size=50):
-        """Match a CodFlow order on aliclik by orderNumber, note ("<num> - .."),
-        or delivery address. Uses the server-side `search` param so the match is
-        on page 1 — no deep scan needed."""
+                         page_size=50, scan_pages=24):
+        """Find a CodFlow order on aliclik. Phase 1: server-side `search`
+        (matches the note — instant for normal orders). Phase 2 (fallback):
+        scan creation-date pages matching the orderNumber SUFFIX — needed when
+        the note was cleared (search indexes the note, not the orderNumber)."""
         who = await self.whoami(email, password)
         company_id = who["companyId"]
         country = who["countryCode"]
         if not end:
-            end = datetime.utcnow().strftime("%Y-%m-%d")
+            end = (datetime.utcnow() + timedelta(days=1)).strftime("%Y-%m-%d")
         if not start:
             start = (datetime.utcnow() - timedelta(days=400)).strftime("%Y-%m-%d")
         q = _norm(query)
@@ -441,28 +456,31 @@ class AliclikSession:
             "companyId": company_id, "countryCode": country, "parentId": 1,
             "filterDate": "creation", "startDate": start, "endDate": end,
             "limit": page_size,
-            # server-side search finds ANY order (not just the recent pages)
-            "search": query,
         }
-        for pg in range(1, max_pages + 1):
+
+        async def _page(pg, search=None):
+            params = {**base, "page": pg}
+            if search:
+                params["search"] = search
             st, body = await self.api_json(
-                email, password, "/order/call/all",
-                params={**base, "page": pg},
-            )
-            result = (body or {}).get("result", []) if isinstance(body, dict) else []
+                email, password, "/order/call/all", params=params)
+            return (body or {}).get("result", []) if isinstance(body, dict) else []
+
+        # Phase 1: server-side search (fast path)
+        for pg in range(1, 3):
+            result = await _page(pg, search=query)
             if not result:
                 break
             for o in result:
-                delivery = (o.get("orderDeliveries") or [{}])[0] or {}
-                ship = o.get("shipping") or {}
-                num = _norm(o.get("orderNumber"))
-                note = _norm(o.get("note"))
-                addr = _norm(delivery.get("address") or ship.get("address1"))
-                # aliclik orderNumber is "<prefix><orderNumber>" (e.g. BESH15X2561);
-                # match the CodFlow number as a suffix too.
-                if (num == q or num.endswith(q) or note == q
-                        or note.startswith(q + " ") or note.startswith(q + " -")
-                        or (q and q in note) or (q and q in addr)):
+                if self._order_matches(o, q):
+                    return o
+        # Phase 2: scan without search, match orderNumber suffix
+        for pg in range(1, scan_pages + 1):
+            result = await _page(pg)
+            if not result:
+                break
+            for o in result:
+                if self._order_matches(o, q):
                     return o
         return None
 
