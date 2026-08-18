@@ -638,65 +638,79 @@ class AliclikSession:
                 "storeCentralProductId": d.get("storeCentralProductId"),
             })
         warehouse_id = o.get("warehouseId") or details[0].get("warehouseId") or -1
-        # Confirming an IMPORTED pre-order CREATES a new order — POST /order
-        # rejects a reused orderNumber ("ya existe"). aliclik generates
-        # companyPrefix + last-7-of-timestamp; derive the prefix by stripping
-        # the CodFlow number suffix off the pre-order's number.
-        q_digits = "".join(ch for ch in str(order_query) if ch.isdigit())
-        onum = o.get("orderNumber") or ""
-        prefix = onum[:-len(q_digits)] if (q_digits and onum.endswith(q_digits)) \
-            else "BESH15X"
-        new_number = f"{prefix}{str(int(datetime.utcnow().timestamp() * 1000))[-7:]}"
-        # Full name goes in shipping.firstName (matches the bundle's
-        # customer.firstName||customer.name). Phone: strip a leading country
-        # code so it isn't doubled with prefixPhone "+51".
-        if phone.startswith("51") and len(phone) > 9:
-            phone = phone[2:]
+        aliclik_order_id = o.get("id")
+        if not aliclik_order_id:
+            raise HTTPException(status_code=400, detail="aliclik order has no id")
         ship_cost = sh.get("shippingCost") or 0
-        # Faithful transcription of aliclik's POST /order builder (36 fields).
+        # aliclik keeps the country-code prefix on the phone ("51945208618") and
+        # prefixPhone "51" — verified against a real 200 confirm. Do NOT strip.
+        pref = (o.get("prefixPhone") or "51").replace("+", "") or "51"
+        # UPDATE the existing order detail(s) in place, putting the COD amount on
+        # the primary line. Preserve skuId / company / warehouse / dropPrice.
+        od_update = []
+        for i, d in enumerate(details):
+            did = d.get("id")
+            if did is None:
+                continue
+            entry = {
+                "id": did,
+                "price": d.get("price"),
+                "quantity": d.get("quantity") or int(quantity or 1),
+                "subtotal": d.get("subtotal"),
+                "skuId": d.get("skuId"),
+                "companyId": d.get("companyId"),
+                "warehouseId": d.get("warehouseId"),
+                "dropPrice": d.get("dropPrice"),
+                "quantityRemnant": d.get("quantityRemnant") or 0,
+            }
+            if i == 0:
+                entry["price"] = amt
+                entry["subtotal"] = amt
+                entry["quantity"] = int(quantity or d.get("quantity") or 1)
+            od_update.append(entry)
+        # The REAL confirm is PATCH /order/update/{id} — it UPDATES the existing
+        # imported order (NOT POST /order create). callStatus stays IMPORTED;
+        # valid geo + confirmationGps:true + transportId make it dispatchable
+        # (TO_PREPARE). Payload transcribed from a captured 200 confirm.
         payload = {
-            "assignedSellerId": None,          # only set when role == SELLER
-            "orderNumber": new_number,
-            "agencyUbigeoId": None,
-            "userId": who["userId"],
             "total": amt,
-            "prefixPhone": o.get("prefixPhone") or "+51",
-            "forceCreateIfTwin": None,
-            "confirmationGps": gps,
-            "note": "",
+            "userId": who["userId"],
+            "comment": o.get("comment") or "",
+            "confirmationGps": True,
+            "updatedBy": who["userId"],
+            "flagMaster": bool(o.get("flagMaster")),
+            "weight": o.get("weight") or 0,
+            "countryCode": "PER",
+            "flagEcom": True if o.get("flagEcom") is None else bool(o.get("flagEcom")),
+            "commissionCod": o.get("commissionCod") or 0,
+            "note": o.get("note") or "",
             "channel": o.get("channel") or "Shopify",
-            "status": o.get("status") or "PENDING_DELIVERY",
-            "commissionCod": o.get("commissionCod") if o.get("commissionCod") is not None else 0,
-            "reason": "",
-            "callStatus": "CONFIRMED",
-            "subStatus": o.get("subStatus"),
             "flagDeliveryExpress": bool(o.get("flagDeliveryExpress")),
-            "additionalCostExpress": 0,
-            "currency": cur,
-            "isOrderAgency": False,
-            "trackingStatus": o.get("trackingStatus"),
-            "paymentType": o.get("paymentType") or "COD",
-            "shippingCost": ship_cost,
-            "managementType": o.get("managementType"),
-            "payAgency": o.get("payAgency"),
-            "productDetail": f"{line_qty} {product_name}",
-            "voucherPayAgency": o.get("voucherPayAgency"),
-            "warehouseName": o.get("warehouseName"),
-            "warehouseId": warehouse_id,
-            "createdAtShopify": o.get("createdAtShopify"),
+            "additionalCostExpress": o.get("additionalCostExpress") or 0,
+            "status": o.get("status") or "PENDING_DELIVERY",
+            "prefixPhone": pref,
             "transportId": transport_id,
-            "orderRelated": None,              # only set when role == MASTER
-            "productShopifyDetail": o.get("productShopifyDetail"),
+            "callStatus": o.get("callStatus") or "IMPORTED",
+            "isOrderAgency": bool(o.get("isOrderAgency")),
+            "warehouseName": o.get("warehouseName"),
+            "shippingCost": ship_cost,
+            "returnCost": o.get("returnCost") or 0,
+            "additionalDeliveryCost": o.get("additionalDeliveryCost") or 0,
             "customer": {"companyId": who["companyId"], "name": customer_name,
                          "lastName": "", "phone": phone},
-            "orderDetails": od,
-            "preOrderHistory": {},
+            "warehouseId": warehouse_id,
+            "warehouse": o.get("warehouse") or {
+                "id": warehouse_id, "name": o.get("warehouseName"),
+                "companyId": details[0].get("companyId")},
+            "productDetail": f"{line_qty} {product_name} / ",
+            "orderDetailsUpdate": {"delete": [], "add": [], "update": od_update},
             "shipping": {
                 "id": sh.get("id"),
-                "operationCode": sh.get("operationCode"),
-                "orderShalom": sh.get("orderShalom"),
-                "codeShalom": sh.get("codeShalom"),
-                "address1": address, "address2": "", "reference": reference or "",
+                "address1": address,
+                "address2": district or sh.get("address2") or "",
+                # CodFlow's customer "Referencias" (order.note) → aliclik reference,
+                # instead of duplicating the address. Falls back to address.
+                "reference": reference or address,
                 "lat": lat.strip() or "0", "lng": lng.strip() or "0",
                 "countryName": sh.get("countryName") or "Perú",
                 "firstName": customer_name, "firstLastName": "", "secondLastName": "",
@@ -707,7 +721,7 @@ class AliclikSession:
                 "provinceCode": str(geo["provinceCode"]),
                 "districtName": geo["districtName"],
                 "districtCode": str(geo["districtCode"]),
-                "postalCode": None,
+                "postalCode": sh.get("postalCode"),
                 "scheduleDate": disp, "dispatchDate": disp,
                 "shippingByAgency": False,
                 "agencyName": "", "agencyAddress": "",
@@ -716,21 +730,19 @@ class AliclikSession:
                 "guideNumber": "", "keyCode": "",
                 "attachFile": "", "addressPickUp": "",
                 "shippingCost": ship_cost,
-                "userShalomPro": None, "passwordShalomPro": None,
-                "merchandiseShalom": None,
-                "senderPhone": phone, "senderContact": "",
-                "agencyOrigin": None, "agencyDestination": None,
-                "guideShalom": None, "serieShalom": None,
             },
         }
         if dry_run:
-            return {"dry_run": True, "order_id": o.get("id"),
-                    "orderNumber": o.get("orderNumber"), "payload": payload}
-        print(f"[aliclik] confirm POST /order {new_number} (gps={gps})", flush=True)
-        st, body = await self.api_json(email, password, "/order",
-                                       method="POST", data=payload)
-        print(f"[aliclik] confirm POST /order -> {st}", flush=True)
-        return {"dry_run": False, "status": st, "order_id": o.get("id"),
+            return {"dry_run": True, "order_id": aliclik_order_id,
+                    "orderNumber": o.get("orderNumber"),
+                    "endpoint": f"PATCH /order/update/{aliclik_order_id}",
+                    "payload": payload}
+        print(f"[aliclik] confirm PATCH /order/update/{aliclik_order_id}", flush=True)
+        st, body = await self.api_json(
+            email, password, f"/order/update/{aliclik_order_id}",
+            method="PATCH", data=payload)
+        print(f"[aliclik] confirm PATCH /order/update/{aliclik_order_id} -> {st}", flush=True)
+        return {"dry_run": False, "status": st, "order_id": aliclik_order_id,
                 "response": body, "payload": payload}
 
 
