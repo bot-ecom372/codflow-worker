@@ -652,19 +652,25 @@ class AliclikSession:
                             target_sku_id=None, target_company_id=None,
                             target_warehouse_id=None, target_warehouse_name=None,
                             target_drop_price=None, city=None, deposit=None,
-                            coverage_gate=False, dry_run=True):
+                            coverage_gate=False, prefetched_order=None,
+                            prefetched_geo=None, dry_run=True):
         """Replicate the operator's full 'Guardar' → POST /order that turns an
         IMPORTED pre-order into a CONFIRMED order ready for dispatch. Builds the
         whole payload from the existing order + the given (CodFlow) data + rules
         (courier=ALIDRIVER id 1, dispatch date=today). dry_run returns the
         payload WITHOUT posting so it can be reviewed first."""
-        o = await self.find_order(email, password, order_query)
+        # prefetched_order lets a batch caller pass the aliclik order object it
+        # already fetched (from /order/call/all) — skips the slow find_order scan
+        # (which can time out on orders whose note doesn't match the search).
+        o = prefetched_order or await self.find_order(email, password, order_query)
         if not o:
             raise HTTPException(status_code=404, detail="order not found on aliclik")
         who = await self.whoami(email, password)
-        geo = await self.resolve_geo(email, password, district=district,
-                                     province=province, department=department,
-                                     hints=f"{city or ''} {address or ''}")
+        # prefetched_geo lets the caller pass geo it resolved locally (from the
+        # ubigeo map) — skips the per-order resolve_geo round-trips.
+        geo = prefetched_geo or await self.resolve_geo(
+            email, password, district=district, province=province,
+            department=department, hints=f"{city or ''} {address or ''}")
         if not geo:
             raise HTTPException(status_code=404, detail="could not resolve geo")
         # ── vigile-copertura (default OFF; caller opts in with coverage_gate) ──
@@ -971,6 +977,8 @@ class ConfirmReq(_Base):
     city: Optional[str] = None             # extra hint for geo resolution
     deposit: Optional[float] = None        # prepaid deposit → COD = total - deposit
     coverage_gate: bool = False            # OFF by default; True = block sin-cobertura
+    prefetched_order: Optional[dict] = None  # skip find_order (batch fast path)
+    prefetched_geo: Optional[dict] = None    # skip resolve_geo (locally resolved)
     dry_run: bool = True
 
 
@@ -1163,4 +1171,5 @@ async def confirm_order(req: ConfirmReq):
         target_warehouse_name=req.target_warehouse_name,
         target_drop_price=req.target_drop_price, city=req.city,
         deposit=req.deposit, coverage_gate=req.coverage_gate,
+        prefetched_order=req.prefetched_order, prefetched_geo=req.prefetched_geo,
         dry_run=req.dry_run)
