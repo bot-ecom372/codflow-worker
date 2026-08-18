@@ -681,7 +681,12 @@ class AliclikSession:
                           "skuId": d.get("skuId"), "companyId": d.get("companyId"),
                           "warehouseId": d.get("warehouseId")}
                          for d in details if d.get("id") is not None]
-            od_add = [{"price": amt, "quantity": int(quantity or 1), "subtotal": amt,
+            # Physical unit count = what Shopify imported (a "2x" bundle imports as
+            # quantity 2), NOT the CodFlow bundle-line count. Keep the COD total on
+            # subtotal and split it across the units for the per-unit price.
+            add_qty = sum(int(d.get("quantity") or 0) for d in details) or int(quantity or 1)
+            unit_price = round(amt / add_qty, 2) if add_qty > 0 else amt
+            od_add = [{"price": unit_price, "quantity": add_qty, "subtotal": amt,
                        "skuId": target_sku_id, "companyId": target_company_id,
                        "warehouseId": target_warehouse_id,
                        "dropPrice": target_drop_price or 0, "quantityRemnant": 0}]
