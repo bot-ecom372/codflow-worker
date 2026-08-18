@@ -444,6 +444,10 @@ class AliclikSession:
                         "provinceName": (prov_obj or {}).get("name"),
                         "districtCode": dist["id"],
                         "districtName": dist.get("name"),
+                        # Coverage (COD delivery) — read live from the district's
+                        # ubigeo flag. This is the real "sin-cobertura" signal.
+                        "coverage": bool(dist.get("flagContraentrega")),
+                        "provinceCoverage": bool((prov_obj or {}).get("flagContraentrega")),
                     }
                 if not province:
                     # avoid O(prov*dist) blow-up when scanning blindly
