@@ -702,10 +702,16 @@ class AliclikSession:
             wh_obj = o.get("warehouse") or {"id": warehouse_id,
                      "name": o.get("warehouseName"),
                      "companyId": details[0].get("companyId")}
+        # Final confirm step (what the operator does at the end): set the call
+        # status to CONFIRMED and clean the note — drop the "No se encontró"
+        # import error, keep "{order} - {district}" + the customer reference.
+        clean_note = f"{order_query} - {district}".strip(" -")
+        if reference:
+            clean_note = f"{clean_note} - {reference}"
         # The REAL confirm is PATCH /order/update/{id} — it UPDATES the existing
-        # imported order (NOT POST /order create). callStatus stays IMPORTED;
-        # valid geo + confirmationGps:true + transportId make it dispatchable
-        # (TO_PREPARE). Payload transcribed from a captured 200 confirm.
+        # imported order (NOT POST /order create). callStatus → CONFIRMED, valid
+        # geo + confirmationGps:true + transportId → dispatchable (TO_PREPARE).
+        # Payload transcribed from a captured 200 confirm.
         payload = {
             "total": amt,
             "userId": who["userId"],
@@ -717,14 +723,14 @@ class AliclikSession:
             "countryCode": "PER",
             "flagEcom": True if o.get("flagEcom") is None else bool(o.get("flagEcom")),
             "commissionCod": o.get("commissionCod") or 0,
-            "note": o.get("note") or "",
+            "note": clean_note,
             "channel": o.get("channel") or "Shopify",
             "flagDeliveryExpress": bool(o.get("flagDeliveryExpress")),
             "additionalCostExpress": o.get("additionalCostExpress") or 0,
             "status": o.get("status") or "PENDING_DELIVERY",
             "prefixPhone": pref,
             "transportId": transport_id,
-            "callStatus": o.get("callStatus") or "IMPORTED",
+            "callStatus": "CONFIRMED",
             "isOrderAgency": bool(o.get("isOrderAgency")),
             "warehouseName": wh_name,
             "shippingCost": ship_cost,
