@@ -578,7 +578,10 @@ class AliclikSession:
                             customer_name, customer_phone, address,
                             department, province, district, product_name,
                             quantity, amount, reference="", gps=None,
-                            transport_id=1, dispatch_date=None, dry_run=True):
+                            transport_id=1, dispatch_date=None,
+                            target_sku_id=None, target_company_id=None,
+                            target_warehouse_id=None, target_warehouse_name=None,
+                            target_drop_price=None, dry_run=True):
         """Replicate the operator's full 'Guardar' → POST /order that turns an
         IMPORTED pre-order into a CONFIRMED order ready for dispatch. Builds the
         whole payload from the existing order + the given (CodFlow) data + rules
@@ -668,6 +671,32 @@ class AliclikSession:
                 entry["subtotal"] = amt
                 entry["quantity"] = int(quantity or d.get("quantity") or 1)
             od_update.append(entry)
+        # Product swap: aliclik imports a dropship PLACEHOLDER product; the operator
+        # replaces it with the real fulfillment SKU (e.g. Glucora → NIBRESMA 24607).
+        # If the caller passes a target product, delete the imported detail(s) and
+        # add the target; otherwise update the existing line in place.
+        if target_sku_id:
+            od_delete = [{"id": d.get("id"),
+                          "quantity": d.get("quantity") or int(quantity or 1),
+                          "skuId": d.get("skuId"), "companyId": d.get("companyId"),
+                          "warehouseId": d.get("warehouseId")}
+                         for d in details if d.get("id") is not None]
+            od_add = [{"price": amt, "quantity": int(quantity or 1), "subtotal": amt,
+                       "skuId": target_sku_id, "companyId": target_company_id,
+                       "warehouseId": target_warehouse_id,
+                       "dropPrice": target_drop_price or 0, "quantityRemnant": 0}]
+            order_details_update = {"delete": od_delete, "add": od_add, "update": []}
+            wh_id = target_warehouse_id or warehouse_id
+            wh_name = target_warehouse_name or o.get("warehouseName")
+            wh_obj = {"id": target_warehouse_id, "name": target_warehouse_name,
+                      "companyId": target_company_id}
+        else:
+            order_details_update = {"delete": [], "add": [], "update": od_update}
+            wh_id = warehouse_id
+            wh_name = o.get("warehouseName")
+            wh_obj = o.get("warehouse") or {"id": warehouse_id,
+                     "name": o.get("warehouseName"),
+                     "companyId": details[0].get("companyId")}
         # The REAL confirm is PATCH /order/update/{id} — it UPDATES the existing
         # imported order (NOT POST /order create). callStatus stays IMPORTED;
         # valid geo + confirmationGps:true + transportId make it dispatchable
@@ -692,18 +721,16 @@ class AliclikSession:
             "transportId": transport_id,
             "callStatus": o.get("callStatus") or "IMPORTED",
             "isOrderAgency": bool(o.get("isOrderAgency")),
-            "warehouseName": o.get("warehouseName"),
+            "warehouseName": wh_name,
             "shippingCost": ship_cost,
             "returnCost": o.get("returnCost") or 0,
             "additionalDeliveryCost": o.get("additionalDeliveryCost") or 0,
             "customer": {"companyId": who["companyId"], "name": customer_name,
                          "lastName": "", "phone": phone},
-            "warehouseId": warehouse_id,
-            "warehouse": o.get("warehouse") or {
-                "id": warehouse_id, "name": o.get("warehouseName"),
-                "companyId": details[0].get("companyId")},
+            "warehouseId": wh_id,
+            "warehouse": wh_obj,
             "productDetail": f"{line_qty} {product_name} / ",
-            "orderDetailsUpdate": {"delete": [], "add": [], "update": od_update},
+            "orderDetailsUpdate": order_details_update,
             "shipping": {
                 "id": sh.get("id"),
                 "address1": address,
@@ -820,6 +847,11 @@ class ConfirmReq(_Base):
     gps: Optional[str] = None
     transport_id: int = 1          # 1 = ALIDRIVER
     dispatch_date: Optional[str] = None
+    target_sku_id: Optional[int] = None
+    target_company_id: Optional[int] = None
+    target_warehouse_id: Optional[int] = None
+    target_warehouse_name: Optional[str] = None
+    target_drop_price: Optional[float] = None
     dry_run: bool = True
 
 
@@ -994,4 +1026,8 @@ async def confirm_order(req: ConfirmReq):
         province=req.province, district=req.district,
         product_name=req.product_name, quantity=req.quantity, amount=req.amount,
         gps=req.gps, transport_id=req.transport_id,
-        dispatch_date=req.dispatch_date, dry_run=req.dry_run)
+        dispatch_date=req.dispatch_date,
+        target_sku_id=req.target_sku_id, target_company_id=req.target_company_id,
+        target_warehouse_id=req.target_warehouse_id,
+        target_warehouse_name=req.target_warehouse_name,
+        target_drop_price=req.target_drop_price, dry_run=req.dry_run)
