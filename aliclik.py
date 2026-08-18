@@ -407,24 +407,34 @@ class AliclikSession:
         return None
 
     async def resolve_geo(self, email, password, district, province=None,
-                          department=None, country="PER"):
+                          department=None, country="PER", hints=None):
         """Messy names -> aliclik ubigeo codes. District is the key output.
-        Cached: ubigeo tables are static, so repeated resolutions are instant."""
+        `hints` = extra free text (city + address) matched against aliclik's own
+        district names, so an order whose district field doesn't match aliclik's
+        naming still resolves when aliclik's name appears in the address (e.g.
+        district "Callería" but the address says "Pucallpa", aliclik's name).
+        Cache is keyed on the structured names only (hints just add resolving
+        power for the not-found case; failures are never cached)."""
         ck = (country, _norm(department), _norm(province), _norm(district))
         if ck in self._geo_cache:
             return self._geo_cache[ck]
         result = await self._resolve_geo_uncached(
-            email, password, district, province, department, country)
+            email, password, district, province, department, country, hints)
         if result:
             self._geo_cache[ck] = result
         return result
 
     async def _resolve_geo_uncached(self, email, password, district, province,
-                                    department, country):
+                                    department, country, hints=None):
         deps = await self._ubigeo(email, password, country, 1, "")
         dep = self._pick(deps, department) if department else None
         dep_ids = [dep["id"]] if dep else [d["id"] for d in deps]
         t = _norm(district)
+        # Haystack of all address text (district + city + address), space-padded
+        # for whole-word matching. Lets an aliclik district name that appears in
+        # the address resolve the order even when the district FIELD doesn't
+        # match aliclik's naming (Callería field vs "Pucallpa" in the address).
+        hay = f" {_norm((district or '') + ' ' + (hints or ''))} "
         # Collect the best district match across the scanned scope instead of
         # returning the first hit. Fixes two bugs:
         #   (1) the old `break` after the first province (when province was
@@ -452,6 +462,10 @@ class AliclikSession:
                         continue
                     if nm == t:
                         score = 3
+                    elif nm and len(nm) >= 4 and f" {nm} " in hay:
+                        # aliclik's district name appears as a whole word in the
+                        # address text — stronger than a fuzzy district-field hit
+                        score = 2
                     elif t and (t in nm or nm in t):
                         score = 1
                     else:
@@ -481,15 +495,18 @@ class AliclikSession:
         return best[1] if best else None
 
     async def check_coverage(self, email, password, district, province=None,
-                             department=None, country="PER"):
+                             department=None, country="PER", city=None,
+                             address=None):
         """Read-only: does this district have COD delivery coverage right now?
         Resolves the exact district (dept→prov→distr) and reads its live
         flagContraentrega. Used as the pre-confirm gate — flag false means
-        sin-cobertura (route to agency), true means ALIDRIVER can ship. Never
-        writes anything."""
+        sin-cobertura (route to agency), true means ALIDRIVER can ship. `city`
+        and `address` are matched against aliclik's district names to resolve
+        naming mismatches (e.g. Callería→Pucallpa). Never writes anything."""
         geo = await self.resolve_geo(email, password, district=district,
                                      province=province, department=department,
-                                     country=country)
+                                     country=country,
+                                     hints=f"{city or ''} {address or ''}")
         if not geo:
             return {"resolved": False, "coverage": None,
                     "reason": "could not resolve district from the given names"}
@@ -634,7 +651,7 @@ class AliclikSession:
                             transport_id=1, dispatch_date=None,
                             target_sku_id=None, target_company_id=None,
                             target_warehouse_id=None, target_warehouse_name=None,
-                            target_drop_price=None, deposit=None,
+                            target_drop_price=None, city=None, deposit=None,
                             coverage_gate=False, dry_run=True):
         """Replicate the operator's full 'Guardar' → POST /order that turns an
         IMPORTED pre-order into a CONFIRMED order ready for dispatch. Builds the
@@ -646,7 +663,8 @@ class AliclikSession:
             raise HTTPException(status_code=404, detail="order not found on aliclik")
         who = await self.whoami(email, password)
         geo = await self.resolve_geo(email, password, district=district,
-                                     province=province, department=department)
+                                     province=province, department=department,
+                                     hints=f"{city or ''} {address or ''}")
         if not geo:
             raise HTTPException(status_code=404, detail="could not resolve geo")
         # ── vigile-copertura (default OFF; caller opts in with coverage_gate) ──
@@ -887,6 +905,8 @@ class ResolveGeoReq(_Base):
     province: Optional[str] = None
     department: Optional[str] = None
     country: str = "PER"
+    city: Optional[str] = None       # extra hints matched against aliclik names
+    address: Optional[str] = None
 
 
 class FindOrderReq(_Base):
@@ -948,6 +968,7 @@ class ConfirmReq(_Base):
     target_warehouse_id: Optional[int] = None
     target_warehouse_name: Optional[str] = None
     target_drop_price: Optional[float] = None
+    city: Optional[str] = None             # extra hint for geo resolution
     deposit: Optional[float] = None        # prepaid deposit → COD = total - deposit
     coverage_gate: bool = False            # OFF by default; True = block sin-cobertura
     dry_run: bool = True
@@ -1044,7 +1065,8 @@ async def resolve_geo(req: ResolveGeoReq):
     _verify_secret(req.secret)
     res = await _session.resolve_geo(
         req.email, req.password, district=req.district,
-        province=req.province, department=req.department, country=req.country)
+        province=req.province, department=req.department, country=req.country,
+        hints=f"{req.city or ''} {req.address or ''}")
     if not res:
         raise HTTPException(status_code=404, detail="ubigeo not found for given names")
     return res
@@ -1057,7 +1079,8 @@ async def check_coverage(req: ResolveGeoReq):
     _verify_secret(req.secret)
     return await _session.check_coverage(
         req.email, req.password, district=req.district,
-        province=req.province, department=req.department, country=req.country)
+        province=req.province, department=req.department, country=req.country,
+        city=req.city, address=req.address)
 
 
 @router.post("/find-order")
@@ -1138,5 +1161,6 @@ async def confirm_order(req: ConfirmReq):
         target_sku_id=req.target_sku_id, target_company_id=req.target_company_id,
         target_warehouse_id=req.target_warehouse_id,
         target_warehouse_name=req.target_warehouse_name,
-        target_drop_price=req.target_drop_price, deposit=req.deposit,
-        coverage_gate=req.coverage_gate, dry_run=req.dry_run)
+        target_drop_price=req.target_drop_price, city=req.city,
+        deposit=req.deposit, coverage_gate=req.coverage_gate,
+        dry_run=req.dry_run)
