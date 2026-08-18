@@ -423,36 +423,85 @@ class AliclikSession:
                                     department, country):
         deps = await self._ubigeo(email, password, country, 1, "")
         dep = self._pick(deps, department) if department else None
-        # If department unknown, we must still narrow provinces: try every dep
-        # whose provinces contain the target district. Cheapest correct path is
-        # to require province OR department; callers (CodFlow AI) supply them.
         dep_ids = [dep["id"]] if dep else [d["id"] for d in deps]
+        t = _norm(district)
+        # Collect the best district match across the scanned scope instead of
+        # returning the first hit. Fixes two bugs:
+        #   (1) the old `break` after the first province (when province was
+        #       unknown) skipped the real province → 404s on Iquitos/Marcona/
+        #       Callería, whose district isn't in their department's 1st province.
+        #   (2) name ambiguity (e.g. "Santa Rosa" exists under several provinces)
+        #       — we now prefer an EXACT district name, and nudge up the one
+        #       whose province name matches what the caller asked for.
+        # Scoring: exact district = 3, fuzzy contains = 1, +1 if province matches.
+        best = None  # (score, payload)
+        blind = dep is None and province is None  # no anchor → bound the sweep
         for did in dep_ids:
             provs = await self._ubigeo(email, password, country, 2, did)
             prov = self._pick(provs, province) if province else None
             prov_ids = [prov["id"]] if prov else [pr["id"] for pr in provs]
+            dep_obj = next((x for x in deps if x["id"] == did), None)
             for pid in prov_ids:
                 dists = await self._ubigeo(email, password, country, 3, pid)
-                dist = self._pick(dists, district)
-                if dist:
-                    dep_obj = next((d for d in deps if d["id"] == did), None)
-                    prov_obj = next((pr for pr in provs if pr["id"] == pid), None)
-                    return {
-                        "departmentCode": did,
-                        "departmentName": (dep_obj or {}).get("name"),
-                        "provinceCode": pid,
-                        "provinceName": (prov_obj or {}).get("name"),
-                        "districtCode": dist["id"],
-                        "districtName": dist.get("name"),
-                        # Coverage (COD delivery) — read live from the district's
-                        # ubigeo flag. This is the real "sin-cobertura" signal.
-                        "coverage": bool(dist.get("flagContraentrega")),
-                        "provinceCoverage": bool((prov_obj or {}).get("flagContraentrega")),
-                    }
-                if not province:
-                    # avoid O(prov*dist) blow-up when scanning blindly
-                    break
-        return None
+                prov_obj = next((x for x in provs if x["id"] == pid), None)
+                prov_exact = bool(province and prov_obj
+                                  and _norm(prov_obj.get("name")) == _norm(province))
+                for d in dists:
+                    nm = _norm(d.get("name"))
+                    if not nm:
+                        continue
+                    if nm == t:
+                        score = 3
+                    elif t and (t in nm or nm in t):
+                        score = 1
+                    else:
+                        continue
+                    if prov_exact:
+                        score += 1
+                    if best is None or score > best[0]:
+                        best = (score, {
+                            "departmentCode": did,
+                            "departmentName": (dep_obj or {}).get("name"),
+                            "provinceCode": pid,
+                            "provinceName": (prov_obj or {}).get("name"),
+                            "districtCode": d["id"],
+                            "districtName": d.get("name"),
+                            # Coverage (COD delivery) — read live from the
+                            # district's ubigeo flag. This is the real
+                            # "sin-cobertura" signal: aliclik's UI only lists
+                            # districts whose flagContraentrega is true.
+                            "coverage": bool(d.get("flagContraentrega")),
+                            "provinceCoverage": bool((prov_obj or {}).get("flagContraentrega")),
+                        })
+                        if score >= 4:   # exact district + exact province → done
+                            return best[1]
+                if blind and best:
+                    # blind full-country sweep: stop at the first plausible hit
+                    return best[1]
+        return best[1] if best else None
+
+    async def check_coverage(self, email, password, district, province=None,
+                             department=None, country="PER"):
+        """Read-only: does this district have COD delivery coverage right now?
+        Resolves the exact district (dept→prov→distr) and reads its live
+        flagContraentrega. Used as the pre-confirm gate — flag false means
+        sin-cobertura (route to agency), true means ALIDRIVER can ship. Never
+        writes anything."""
+        geo = await self.resolve_geo(email, password, district=district,
+                                     province=province, department=department,
+                                     country=country)
+        if not geo:
+            return {"resolved": False, "coverage": None,
+                    "reason": "could not resolve district from the given names"}
+        return {
+            "resolved": True,
+            "coverage": geo["coverage"],
+            "provinceCoverage": geo["provinceCoverage"],
+            "districtName": geo["districtName"],
+            "districtCode": geo["districtCode"],
+            "provinceName": geo["provinceName"],
+            "departmentName": geo["departmentName"],
+        }
 
     # ── orders ───────────────────────────────────────────────────────────
     @staticmethod
@@ -585,7 +634,8 @@ class AliclikSession:
                             transport_id=1, dispatch_date=None,
                             target_sku_id=None, target_company_id=None,
                             target_warehouse_id=None, target_warehouse_name=None,
-                            target_drop_price=None, dry_run=True):
+                            target_drop_price=None, deposit=None,
+                            coverage_gate=False, dry_run=True):
         """Replicate the operator's full 'Guardar' → POST /order that turns an
         IMPORTED pre-order into a CONFIRMED order ready for dispatch. Builds the
         whole payload from the existing order + the given (CodFlow) data + rules
@@ -599,6 +649,30 @@ class AliclikSession:
                                      province=province, department=department)
         if not geo:
             raise HTTPException(status_code=404, detail="could not resolve geo")
+        # ── vigile-copertura (default OFF; caller opts in with coverage_gate) ──
+        # The real sin-cobertura signal is the district's flagContraentrega:
+        # aliclik's UI only lists districts with flag=true (verified live — e.g.
+        # provincia Abancay lists ONLY the "Abancay" district; the other 8 are
+        # flag=false and hidden). When gating is on and the resolved district has
+        # no coverage, DO NOT confirm an ALIDRIVER shipment — report sin_cobertura
+        # so CodFlow routes the order to an agency (Shalom/Olva) instead. Nothing
+        # is written to aliclik in this branch.
+        if coverage_gate and not geo.get("coverage"):
+            return {
+                "sin_cobertura": True,
+                "confirmed": False,
+                "order_id": o.get("id"),
+                "orderNumber": o.get("orderNumber"),
+                "geo": {
+                    "departmentName": geo.get("departmentName"),
+                    "provinceName": geo.get("provinceName"),
+                    "districtName": geo.get("districtName"),
+                    "districtCode": geo.get("districtCode"),
+                    "coverage": False,
+                },
+                "reason": ("district has no COD coverage (flagContraentrega=false)"
+                           " — route to agency, do not confirm ALIDRIVER"),
+            }
         sh = o.get("shipping") or {}
         details = o.get("orderDetails") or []
         if not details:
@@ -630,6 +704,13 @@ class AliclikSession:
         # set from the given data.
         line_qty = details[0].get("quantity") or int(quantity or 1)
         amt = float(amount) if amount is not None else (o.get("total") or 0)
+        # COD collectable = order total minus any prepaid deposit. Province orders
+        # with a reservation deposit collect only the remainder on delivery
+        # (e.g. total 99, deposit 20 → 79 COD). `deposit` defaults to None/0, so
+        # Lima orders (no deposit) are unchanged. `amount` stays the FULL total.
+        dep_amt = float(deposit or 0)
+        if dep_amt > 0:
+            amt = round(max(0.0, amt - dep_amt), 2)
         cur = o.get("currency")
         cur = cur.get("code") if isinstance(cur, dict) else (cur or "PEN")
         od = []
@@ -867,6 +948,8 @@ class ConfirmReq(_Base):
     target_warehouse_id: Optional[int] = None
     target_warehouse_name: Optional[str] = None
     target_drop_price: Optional[float] = None
+    deposit: Optional[float] = None        # prepaid deposit → COD = total - deposit
+    coverage_gate: bool = False            # OFF by default; True = block sin-cobertura
     dry_run: bool = True
 
 
@@ -967,6 +1050,16 @@ async def resolve_geo(req: ResolveGeoReq):
     return res
 
 
+@router.post("/check-coverage")
+async def check_coverage(req: ResolveGeoReq):
+    """Read-only COD-coverage check for a district (the pre-confirm gate).
+    Returns {resolved, coverage: bool|None, districtName, ...}. Never writes."""
+    _verify_secret(req.secret)
+    return await _session.check_coverage(
+        req.email, req.password, district=req.district,
+        province=req.province, department=req.department, country=req.country)
+
+
 @router.post("/find-order")
 async def find_order(req: FindOrderReq):
     _verify_secret(req.secret)
@@ -1045,4 +1138,5 @@ async def confirm_order(req: ConfirmReq):
         target_sku_id=req.target_sku_id, target_company_id=req.target_company_id,
         target_warehouse_id=req.target_warehouse_id,
         target_warehouse_name=req.target_warehouse_name,
-        target_drop_price=req.target_drop_price, dry_run=req.dry_run)
+        target_drop_price=req.target_drop_price, deposit=req.deposit,
+        coverage_gate=req.coverage_gate, dry_run=req.dry_run)
