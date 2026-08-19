@@ -274,10 +274,15 @@ class AliclikSession:
                     {"base": ALICLIK_API, "path": path, "method": method,
                      "params": p, "data": data},
                 )
-                # status 0 = network/dead-session fetch failure → rebuild the
+                # status 0 = network/dead-session fetch failure.
+                # 401/403 = aliclik rejected the JWT (session logged out or token
+                # expired) — the warm page still holds a stale token so _ensure's
+                # presence check won't catch it. In all these cases rebuild the
                 # whole context (fresh login) and retry.
-                if isinstance(res, dict) and res.get("status") == 0 and attempt < 2:
-                    print(f"[aliclik] {method} {path} net-fail (att {attempt+1}), "
+                if (isinstance(res, dict) and res.get("status") in (0, 401, 403)
+                        and attempt < 2):
+                    print(f"[aliclik] {method} {path} auth/net-fail "
+                          f"(status {res.get('status')}, att {attempt+1}), "
                           "rebuilding session", flush=True)
                     await self._reset_session()
                     await asyncio.sleep(1.5)
