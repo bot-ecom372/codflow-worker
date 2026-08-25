@@ -664,3 +664,66 @@ async def demo_sessions(req: SessionRequest):
         }
     finally:
         _session_busy = False
+
+
+# ═══════════════════════════════════════════
+# VOICE TRANSCRIPTION (Whisper — open source, runs HERE, no external service)
+# WhatsApp voice notes → text so the CodFlow AI can answer them. The model is
+# lazy-loaded once (small/int8 ≈ 500MB RAM, fits the Standard instance) and
+# guarded by a lock (CTranslate2 is thread-safe for inference, but load isn't).
+# ═══════════════════════════════════════════
+
+_whisper_model = None
+_whisper_lock = threading.Lock()
+
+def _get_whisper():
+    global _whisper_model
+    if _whisper_model is None:
+        with _whisper_lock:
+            if _whisper_model is None:
+                from faster_whisper import WhisperModel
+                _whisper_model = WhisperModel(
+                    "small", device="cpu", compute_type="int8",
+                    download_root="./whisper-models",
+                )
+    return _whisper_model
+
+
+class TranscribeReq(BaseModel):
+    secret: str
+    url: str
+    language: str = "es"
+
+
+@app.post("/transcribe")
+def transcribe(req: TranscribeReq):
+    _verify_secret(req.secret)
+    if not req.url.startswith("https://"):
+        raise HTTPException(status_code=400, detail="https url required")
+    try:
+        resp = requests.get(req.url, timeout=15)
+        resp.raise_for_status()
+        audio = resp.content
+    except Exception as e:
+        raise HTTPException(status_code=422, detail=f"audio fetch failed: {e}")
+    if len(audio) < 200 or len(audio) > 20_000_000:
+        raise HTTPException(status_code=422, detail="audio size out of range")
+
+    import tempfile
+    t0 = time.time()
+    with tempfile.NamedTemporaryFile(suffix=".ogg", delete=True) as f:
+        f.write(audio)
+        f.flush()
+        try:
+            segments, info = _get_whisper().transcribe(
+                f.name,
+                language=(req.language if req.language in ("es", "it", "en") else "es"),
+                vad_filter=True,
+            )
+            text = " ".join(s.text.strip() for s in segments).strip()
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"transcription failed: {e}")
+    # Whisper hallucinates fillers on silence — treat junk as empty.
+    if len(text) < 2:
+        return {"text": "", "duration": round(getattr(info, "duration", 0), 1), "took": round(time.time() - t0, 1)}
+    return {"text": text[:2000], "duration": round(getattr(info, "duration", 0), 1), "took": round(time.time() - t0, 1)}
