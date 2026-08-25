@@ -675,6 +675,7 @@ async def demo_sessions(req: SessionRequest):
 
 _whisper_model = None
 _whisper_lock = threading.Lock()
+_transcribe_slot = threading.Semaphore(1)
 
 def _get_whisper():
     global _whisper_model
@@ -692,7 +693,7 @@ def _get_whisper():
 class TranscribeReq(BaseModel):
     secret: str
     url: str
-    language: str = "es"
+    language: str = "auto"  # auto = Whisper detects (IT store customers speak Italian)
 
 
 @app.post("/transcribe")
@@ -709,20 +710,27 @@ def transcribe(req: TranscribeReq):
     if len(audio) < 200 or len(audio) > 20_000_000:
         raise HTTPException(status_code=422, detail="audio size out of range")
 
+    # One transcription at a time (single-CPU instance): a second vocal waits
+    # up to 15s for the slot, then 503 → the app fails open (ack + operator).
+    if not _transcribe_slot.acquire(timeout=15):
+        raise HTTPException(status_code=503, detail="transcriber busy")
     import tempfile
     t0 = time.time()
-    with tempfile.NamedTemporaryFile(suffix=".ogg", delete=True) as f:
-        f.write(audio)
-        f.flush()
-        try:
-            segments, info = _get_whisper().transcribe(
-                f.name,
-                language=(req.language if req.language in ("es", "it", "en") else "es"),
-                vad_filter=True,
-            )
-            text = " ".join(s.text.strip() for s in segments).strip()
-        except Exception as e:
-            raise HTTPException(status_code=500, detail=f"transcription failed: {e}")
+    try:
+        with tempfile.NamedTemporaryFile(suffix=".ogg", delete=True) as f:
+            f.write(audio)
+            f.flush()
+            try:
+                segments, info = _get_whisper().transcribe(
+                    f.name,
+                    language=(req.language if req.language in ("es", "it", "en") else None),
+                    vad_filter=True,
+                )
+                text = " ".join(s.text.strip() for s in segments).strip()
+            except Exception as e:
+                raise HTTPException(status_code=500, detail=f"transcription failed: {e}")
+    finally:
+        _transcribe_slot.release()
     # Whisper hallucinates fillers on silence — treat junk as empty.
     if len(text) < 2:
         return {"text": "", "duration": round(getattr(info, "duration", 0), 1), "took": round(time.time() - t0, 1)}
