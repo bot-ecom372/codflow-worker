@@ -10,8 +10,8 @@ python -m playwright install --with-deps chromium || python -m playwright instal
 
 # Pre-download Whisper small int8 into the slug so the first vocal after a
 # deploy doesn't pay the ~460MB model download.
-python - <<'EOF'
+python - <<EOF || echo "warn: whisper predownload failed (lazy download at first vocal)"
 from faster_whisper import WhisperModel
-WhisperModel("small", device="cpu", compute_type="int8", download_root="./whisper-models")
+WhisperModel("small", device="cpu", compute_type="int8", download_root="$PWD/whisper-models")
 print("whisper small int8 cached")
 EOF

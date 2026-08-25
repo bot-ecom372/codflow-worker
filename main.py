@@ -34,7 +34,7 @@ import requests
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 
-app = FastAPI(title="CodFlow Worker", version="1.2.0")
+app = FastAPI(title="CodFlow Worker", version="1.4.0")
 
 # Single-flight lock
 _upload_lock = threading.Lock()
@@ -396,7 +396,7 @@ def _fetch_tracking(session: requests.Session, base_url: str, days_back: int = 1
 
 @app.get("/")
 def health():
-    return {"status": "ok", "service": "codflow-worker", "version": "1.3.0-aliclik"}
+    return {"status": "ok", "service": "codflow-worker", "version": "1.4.0-voice"}
 
 
 @app.post("/test-connection")
@@ -570,7 +570,7 @@ _session_started_at: float = 0
 async def _launch_browser():
     global _browser
     # Lazy by design. Launching a browser eagerly keeps ~300MB resident and,
-    # together with the aliclik browser, exceeds the 512MB instance limit
+    # together with the aliclik browser, exceeds the 2GB Standard instance
     # (observed: Render OOM auto-restart). /demo/sessions already re-launches
     # its browser on demand, and aliclik launches its own on first use — so we
     # keep startup memory minimal and never hold two idle browsers.
@@ -685,7 +685,7 @@ def _get_whisper():
                 from faster_whisper import WhisperModel
                 _whisper_model = WhisperModel(
                     "small", device="cpu", compute_type="int8",
-                    download_root="./whisper-models",
+                    download_root=os.path.join(os.path.dirname(os.path.abspath(__file__)), "whisper-models"),
                 )
     return _whisper_model
 
@@ -699,16 +699,29 @@ class TranscribeReq(BaseModel):
 @app.post("/transcribe")
 def transcribe(req: TranscribeReq):
     _verify_secret(req.secret)
-    if not req.url.startswith("https://"):
-        raise HTTPException(status_code=400, detail="https url required")
+    # SSRF hardening: only OUR storage host, no redirects, streamed with a hard
+    # cap, and generic error details (no URL/response echo).
+    allowed_host = os.getenv("TRANSCRIBE_ALLOWED_HOST", "bmaiaupckyzjrhezeuer.supabase.co")
+    from urllib.parse import urlparse
+    parsed = urlparse(req.url)
+    if parsed.scheme != "https" or parsed.hostname != allowed_host:
+        raise HTTPException(status_code=400, detail="url not allowed")
     try:
-        resp = requests.get(req.url, timeout=15)
-        resp.raise_for_status()
-        audio = resp.content
-    except Exception as e:
-        raise HTTPException(status_code=422, detail=f"audio fetch failed: {e}")
-    if len(audio) < 200 or len(audio) > 20_000_000:
-        raise HTTPException(status_code=422, detail="audio size out of range")
+        audio = b""
+        with requests.get(req.url, timeout=15, stream=True, allow_redirects=False) as resp:
+            if resp.status_code != 200:
+                raise ValueError("bad status")
+            cl = resp.headers.get("Content-Length")
+            if cl and int(cl) > 20_000_000:
+                raise ValueError("too large")
+            for chunk in resp.iter_content(chunk_size=262144):
+                audio += chunk
+                if len(audio) > 20_000_000:
+                    raise ValueError("too large")
+    except Exception:
+        raise HTTPException(status_code=422, detail="audio fetch failed")
+    if len(audio) < 200:
+        raise HTTPException(status_code=422, detail="audio too small")
 
     # One transcription at a time (single-CPU instance): a second vocal waits
     # up to 15s for the slot, then 503 → the app fails open (ack + operator).
@@ -725,10 +738,20 @@ def transcribe(req: TranscribeReq):
                     f.name,
                     language=(req.language if req.language in ("es", "it", "en") else None),
                     vad_filter=True,
+                    beam_size=1,  # ~3x faster; negligible quality loss on short vocals
                 )
-                text = " ".join(s.text.strip() for s in segments).strip()
-            except Exception as e:
-                raise HTTPException(status_code=500, detail=f"transcription failed: {e}")
+                if getattr(info, "duration", 0) > 300:
+                    raise HTTPException(status_code=422, detail="audio too long")
+                parts = []
+                for seg in segments:  # lazy generator: bound the decode time too
+                    parts.append(seg.text.strip())
+                    if time.time() - t0 > 55:
+                        break
+                text = " ".join(parts).strip()
+            except HTTPException:
+                raise
+            except Exception:
+                raise HTTPException(status_code=500, detail="transcription failed")
     finally:
         _transcribe_slot.release()
     # Whisper hallucinates fillers on silence — treat junk as empty.
