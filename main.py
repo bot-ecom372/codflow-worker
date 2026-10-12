@@ -31,7 +31,7 @@ from urllib.parse import unquote
 
 import pyotp
 import requests
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Header
 from pydantic import BaseModel
 
 app = FastAPI(title="CodFlow Worker", version="1.4.0")
@@ -537,6 +537,7 @@ def reconcile(req: ReconcileRequest):
 class SessionRequest(BaseModel):
     store_url: str
     sessions_count: int = 5
+    secret: str = ""
 
 _MOBILE_UAS = [
     "Mozilla/5.0 (iPhone; CPU iPhone OS 17_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Mobile/15E148 Safari/604.1",
@@ -562,8 +563,9 @@ window.chrome = {runtime: {}, loadTimes: function(){}, csi: function(){}};
 
 _browser = None
 _playwright_instance = None
-_session_busy = False
-_session_started_at: float = 0
+# One sessions run at a time. A real lock (was: a busy flag force-cleared after 50s, which let a
+# second run start while the first one was still using the browser).
+_session_lock = asyncio.Lock()
 
 
 @app.on_event("startup")
@@ -590,80 +592,137 @@ async def _close_browser():
 @app.post("/demo/sessions")
 async def demo_sessions(req: SessionRequest):
     """Generate real Shopify sessions via Playwright (JS execution required for analytics)."""
-    global _session_busy, _session_started_at, _browser, _playwright_instance
-
-    # Stale guard: if busy for >50s, force-clear
-    if _session_busy and (time.time() - _session_started_at > 50):
-        _session_busy = False
-
-    if _session_busy:
+    global _browser, _playwright_instance
+    _verify_secret(req.secret)
+    if _session_lock.locked():
         return {"success": False, "completed": 0, "errors": 0, "message": "busy"}
+    async with _session_lock:
+        return await _demo_sessions_locked(req)
 
-    _session_busy = True
-    _session_started_at = time.time()
 
-    try:
-        # Restart browser if crashed
-        if not _browser or not _browser.is_connected():
-            from playwright.async_api import async_playwright
-            if _playwright_instance:
-                try:
-                    await _playwright_instance.stop()
-                except:
-                    pass
-            _playwright_instance = await async_playwright().start()
-            _browser = await _playwright_instance.chromium.launch(
-                headless=True,
-                args=["--disable-blink-features=AutomationControlled", "--no-sandbox", "--disable-dev-shm-usage"],
-            )
-
-        count = min(req.sessions_count, 5)
-        completed = 0
-        errors = 0
-        store_url = req.store_url.rstrip("/")
-
-        for i in range(count):
+async def _demo_sessions_locked(req: SessionRequest):
+    global _browser, _playwright_instance
+    # Restart browser if crashed
+    if not _browser or not _browser.is_connected():
+        from playwright.async_api import async_playwright
+        if _playwright_instance:
             try:
-                ua = random.choice(_MOBILE_UAS if random.random() < 0.7 else _DESKTOP_UAS)
-                is_mobile = "Mobile" in ua
-                path = random.choice(_PATHS)
-                page_url = f"{store_url}{path}"
+                await _playwright_instance.stop()
+            except:
+                pass
+        _playwright_instance = await async_playwright().start()
+        _browser = await _playwright_instance.chromium.launch(
+            headless=True,
+            args=["--disable-blink-features=AutomationControlled", "--no-sandbox", "--disable-dev-shm-usage"],
+        )
 
-                context = await _browser.new_context(
-                    user_agent=ua,
-                    viewport={"width": 390, "height": 844} if is_mobile else {"width": 1440, "height": 900},
-                    locale="it-IT",
-                    timezone_id="Europe/Rome",
-                    is_mobile=is_mobile,
-                    has_touch=is_mobile,
-                )
-                await context.add_init_script(_STEALTH_SCRIPT)
-                page = await context.new_page()
+    count = min(req.sessions_count, 5)
+    completed = 0
+    errors = 0
+    store_url = req.store_url.rstrip("/")
 
-                await page.goto(page_url, wait_until="domcontentloaded", timeout=15000)
-                # Wait for Shopify analytics JS to fire
-                await page.wait_for_timeout(3000)
+    for i in range(count):
+        context = None
+        try:
+            ua = random.choice(_MOBILE_UAS if random.random() < 0.7 else _DESKTOP_UAS)
+            is_mobile = "Mobile" in ua
+            path = random.choice(_PATHS)
+            page_url = f"{store_url}{path}"
 
-                await page.close()
-                await context.close()
-                completed += 1
-            except Exception as e:
-                errors += 1
-                print(f"[Sessions] Visit {i+1} error: {e}")
-                try:
+            context = await _browser.new_context(
+                user_agent=ua,
+                viewport={"width": 390, "height": 844} if is_mobile else {"width": 1440, "height": 900},
+                locale="it-IT",
+                timezone_id="Europe/Rome",
+                is_mobile=is_mobile,
+                has_touch=is_mobile,
+            )
+            await context.add_init_script(_STEALTH_SCRIPT)
+            page = await context.new_page()
+
+            await page.goto(page_url, wait_until="domcontentloaded", timeout=15000)
+            # Wait for Shopify analytics JS to fire
+            await page.wait_for_timeout(3000)
+
+            await page.close()
+            await context.close()
+            completed += 1
+        except Exception as e:
+            errors += 1
+            print(f"[Sessions] Visit {i+1} error: {e}")
+            try:
+                if context:
                     await context.close()
-                except:
-                    pass
+            except Exception:
+                pass
 
-        return {
-            "success": True,
-            "completed": completed,
-            "errors": errors,
-            "requested": req.sessions_count,
-            "capped": count,
-        }
-    finally:
-        _session_busy = False
+    return {
+        "success": True,
+        "completed": completed,
+        "errors": errors,
+        "requested": req.sessions_count,
+        "capped": count,
+    }
+
+
+# ═══════════════════════════════════════════
+# DEMO: GEO TEST SESSIONS THROUGH STICKY PROXIES (2026-10-12) — see demo_geo.py
+# ═══════════════════════════════════════════
+
+class GeoTestRequest(BaseModel):
+    store_url: str
+    cities: list[str]
+    secret: str = ""
+    dwell_ms: int = 8000
+
+_geo_browser = None
+_geo_playwright = None
+
+
+@app.get("/demo/geo-test/config")
+def demo_geo_config(x_worker_secret: str = Header(default="")):
+    """Which env vars are still missing (names only, never values). Secret in a header, not the URL."""
+    _verify_geo_secret(x_worker_secret)
+    from demo_geo import ProxyConfig, GeoTestError, CITIES
+    try:
+        cfg = ProxyConfig.from_env()
+        missing = cfg.missing()
+    except GeoTestError as ge:
+        missing = [ge.code]
+        cfg = None
+    return {"ready": not missing, "missing": missing, "cities": list(CITIES),
+            "provider": cfg.provider if cfg else "", "geo_check_url": cfg.geo_check_url if cfg else ""}
+
+
+@app.post("/demo/geo-test")
+async def demo_geo_test(req: GeoTestRequest):
+    """One session per requested city, each via its own sticky proxy session. Strict geo."""
+    global _geo_browser, _geo_playwright
+    _verify_geo_secret(req.secret)
+    from demo_geo import ProxyConfig, GeoTestError, run_geo_test
+    if not re.match(r"^https://[a-z0-9-]+(\.[a-z0-9-]+)+/?$", req.store_url.strip().lower()):
+        raise HTTPException(status_code=400, detail="store_url deve essere https://dominio senza percorso")
+    cities = [c.strip().lower() for c in req.cities][:3]
+    try:
+        cfg = ProxyConfig.from_env()
+        if not _geo_browser or not _geo_browser.is_connected():
+            from playwright.async_api import async_playwright
+            _geo_playwright = _geo_playwright or await async_playwright().start()
+            # Plain browser: no automation-hiding flags or scripts for the geo test.
+            _geo_browser = await _geo_playwright.chromium.launch(headless=True, args=["--no-sandbox", "--disable-dev-shm-usage"])
+        results = await run_geo_test(_geo_browser, req.store_url.strip().rstrip("/"), cities, cfg,
+                                     dwell_ms=max(3000, min(20000, req.dwell_ms)))
+    except GeoTestError as ge:
+        status = 409 if ge.code == "busy" else 412
+        raise HTTPException(status_code=status, detail={"code": ge.code, "message": str(ge)})
+    return {"success": True, "sessions": [r.__dict__ for r in results]}
+
+
+def _verify_geo_secret(secret: str):
+    # Fail closed: the geo test needs an explicitly configured secret (no built-in default).
+    expected = os.getenv("WORKER_SECRET", "")
+    if not expected or expected == "codflow-worker-2026" or secret != expected:
+        raise HTTPException(status_code=401, detail="Invalid worker secret")
 
 
 # ═══════════════════════════════════════════
