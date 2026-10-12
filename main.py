@@ -666,63 +666,94 @@ async def _demo_sessions_locked(req: SessionRequest):
 
 
 # ═══════════════════════════════════════════
-# DEMO: GEO TEST SESSIONS THROUGH STICKY PROXIES (2026-10-12) — see demo_geo.py
+# DEMO: PROXY SESSIONS BY CITY (2026-10-12) — see demo_geo.py
+# Separate secret (DEMO_GEO_SECRET) from WORKER_SECRET: no shared-secret rotation needed.
+# Proxy config + credentials come per request from CodFlow (encrypted at rest there).
 # ═══════════════════════════════════════════
 
-class GeoTestRequest(BaseModel):
+class ProxyPayload(BaseModel):
+    provider: str = ""
+    server: str
+    username_template: str
+    password_template: str = ""
+    user: str = ""
+    password: str = ""
+    geo_map: dict
+    geo_check_url: str = ""
+    max_concurrency: int = 1
+
+class ProxyTestRequest(BaseModel):
+    proxy: ProxyPayload
+    cities: list[str]
+
+class GeoSessionsRequest(BaseModel):
+    proxy: ProxyPayload
     store_url: str
     cities: list[str]
-    secret: str = ""
     dwell_ms: int = 8000
 
 _geo_browser = None
 _geo_playwright = None
 
 
-@app.get("/demo/geo-test/config")
-def demo_geo_config(x_worker_secret: str = Header(default="")):
-    """Which env vars are still missing (names only, never values). Secret in a header, not the URL."""
-    _verify_geo_secret(x_worker_secret)
-    from demo_geo import ProxyConfig, GeoTestError, CITIES
-    try:
-        cfg = ProxyConfig.from_env()
-        missing = cfg.missing()
-    except GeoTestError as ge:
-        missing = [ge.code]
-        cfg = None
-    return {"ready": not missing, "missing": missing, "cities": list(CITIES),
-            "provider": cfg.provider if cfg else "", "geo_check_url": cfg.geo_check_url if cfg else ""}
+def _verify_geo_secret(secret: str):
+    expected = os.getenv("DEMO_GEO_SECRET", "")
+    if len(expected) < 24 or secret != expected:  # fail closed, no default
+        raise HTTPException(status_code=401, detail="Invalid secret")
 
 
-@app.post("/demo/geo-test")
-async def demo_geo_test(req: GeoTestRequest):
-    """One session per requested city, each via its own sticky proxy session. Strict geo."""
+async def _geo_browser_get():
     global _geo_browser, _geo_playwright
-    _verify_geo_secret(req.secret)
+    if not _geo_browser or not _geo_browser.is_connected():
+        from playwright.async_api import async_playwright
+        _geo_playwright = _geo_playwright or await async_playwright().start()
+        # Plain headless Chromium: no automation-hiding flags or scripts.
+        _geo_browser = await _geo_playwright.chromium.launch(headless=True, args=["--no-sandbox", "--disable-dev-shm-usage"])
+    return _geo_browser
+
+
+def _cities(raw: list[str], cap: int) -> list[str]:
+    out = [str(c).strip().lower() for c in raw][:cap]
+    if not out:
+        raise HTTPException(status_code=400, detail="cities vuoto")
+    return out
+
+
+@app.get("/demo/geo/health")
+def demo_geo_health(x_worker_secret: str = Header(default="")):
+    _verify_geo_secret(x_worker_secret)
+    from demo_geo import CITIES
+    return {"ok": True, "cities": list(CITIES), "version": "geo-1"}
+
+
+@app.post("/demo/proxy-test")
+async def demo_proxy_test(req: ProxyTestRequest, x_worker_secret: str = Header(default="")):
+    """Connection test: per city, egress IP + location through the proxy. No store visit."""
+    _verify_geo_secret(x_worker_secret)
     from demo_geo import ProxyConfig, GeoTestError, run_geo_test
-    if not re.match(r"^https://[a-z0-9-]+(\.[a-z0-9-]+)+/?$", req.store_url.strip().lower()):
-        raise HTTPException(status_code=400, detail="store_url deve essere https://dominio senza percorso")
-    cities = [c.strip().lower() for c in req.cities][:3]
     try:
-        cfg = ProxyConfig.from_env()
-        if not _geo_browser or not _geo_browser.is_connected():
-            from playwright.async_api import async_playwright
-            _geo_playwright = _geo_playwright or await async_playwright().start()
-            # Plain browser: no automation-hiding flags or scripts for the geo test.
-            _geo_browser = await _geo_playwright.chromium.launch(headless=True, args=["--no-sandbox", "--disable-dev-shm-usage"])
-        results = await run_geo_test(_geo_browser, req.store_url.strip().rstrip("/"), cities, cfg,
-                                     dwell_ms=max(3000, min(20000, req.dwell_ms)))
+        cfg = ProxyConfig.from_dict(req.proxy.model_dump())
+        results = await run_geo_test(await _geo_browser_get(), None, _cities(req.cities, 3), cfg)
     except GeoTestError as ge:
-        status = 409 if ge.code == "busy" else 412
-        raise HTTPException(status_code=status, detail={"code": ge.code, "message": str(ge)})
+        raise HTTPException(status_code=409 if ge.code == "busy" else 412, detail={"code": ge.code, "message": str(ge)})
     return {"success": True, "sessions": [r.__dict__ for r in results]}
 
 
-def _verify_geo_secret(secret: str):
-    # Fail closed: the geo test needs an explicitly configured secret (no built-in default).
-    expected = os.getenv("WORKER_SECRET", "")
-    if not expected or expected == "codflow-worker-2026" or secret != expected:
-        raise HTTPException(status_code=401, detail="Invalid worker secret")
+@app.post("/demo/geo-sessions")
+async def demo_geo_sessions(req: GeoSessionsRequest, x_worker_secret: str = Header(default="")):
+    """Demo store visits through the proxy, one per entry of `cities`. Strict geo: a session
+    whose proxy fails or is in the wrong place never visits the store (no direct fallback)."""
+    _verify_geo_secret(x_worker_secret)
+    from demo_geo import ProxyConfig, GeoTestError, run_geo_test
+    if not re.match(r"^https://[a-z0-9-]+(\.[a-z0-9-]+)+/?$", req.store_url.strip().lower()):
+        raise HTTPException(status_code=400, detail="store_url deve essere https://dominio senza percorso")
+    try:
+        cfg = ProxyConfig.from_dict(req.proxy.model_dump())
+        results = await run_geo_test(await _geo_browser_get(), req.store_url.strip().rstrip("/"), _cities(req.cities, 6), cfg,
+                                     dwell_ms=max(3000, min(20000, req.dwell_ms)))
+    except GeoTestError as ge:
+        raise HTTPException(status_code=409 if ge.code == "busy" else 412, detail={"code": ge.code, "message": str(ge)})
+    return {"success": True, "sessions": [r.__dict__ for r in results]}
 
 
 # ═══════════════════════════════════════════

@@ -6,22 +6,22 @@ import demo_geo
 from demo_geo import ProxyConfig, GeoTestError, location_matches, run_geo_test, new_session_id
 
 ENV = {
-    "DEMO_PROXY_ENABLED": "1", "DEMO_PROXY_PROVIDER": "test", "DEMO_PROXY_SERVER": "http://gw.example:8000",
-    "DEMO_PROXY_USERNAME_TEMPLATE": "{user}-geo-{geo}-s-{session}", "DEMO_PROXY_USERNAME": "u1", "DEMO_PROXY_PASSWORD": "pw",
-    "DEMO_PROXY_GEO_MAP": json.dumps({"lima": "pe_lima", "arequipa": "pe_arequipa", "trujillo": "pe_trujillo"}),
+    "provider": "test", "server": "http://gw.example:8000",
+    "username_template": "{user}-geo-{geo}-s-{session}", "user": "u1", "password": "pw",
+    "geo_map": {"lima": "pe_lima", "arequipa": "pe_arequipa", "trujillo": "pe_trujillo"},
 }
 
 
-def test_missing_lists_names_only_and_disabled_by_default():
-    cfg = ProxyConfig.from_env({})
+def test_missing_lists_names_only():
+    cfg = ProxyConfig.from_dict({})
     m = cfg.missing()
-    assert "DEMO_PROXY_ENABLED" in m and "DEMO_PROXY_SERVER" in m
+    assert "server" in m and "username_template" in m
     assert all("pw" not in x for x in m)
-    assert ProxyConfig.from_env(ENV).missing() == []
+    assert ProxyConfig.from_dict(ENV).missing() == []
 
 
 def test_sticky_session_distinct_per_context_and_strict_city():
-    cfg = ProxyConfig.from_env(ENV)
+    cfg = ProxyConfig.from_dict(ENV)
     a, b = new_session_id(), new_session_id()
     assert a != b
     p = cfg.for_city("lima", a)
@@ -29,7 +29,7 @@ def test_sticky_session_distinct_per_context_and_strict_city():
     with pytest.raises(GeoTestError) as e:
         cfg.for_city("cusco", a)
     assert e.value.code == "unknown_city"
-    cfg2 = ProxyConfig.from_env({**ENV, "DEMO_PROXY_GEO_MAP": json.dumps({"lima": "x"})})
+    cfg2 = ProxyConfig.from_dict({**ENV, "geo_map": {"lima": "x"}})
     with pytest.raises(GeoTestError) as e:
         cfg2.for_city("arequipa", a)
     assert e.value.code == "city_not_configured"
@@ -90,7 +90,7 @@ def test_three_cities_ok_distinct_sessions_and_observations():
             "arequipa": {"ip": "2.2.2.2", "country": "PE", "city": "Arequipa", "region": "Arequipa"},
             "trujillo": {"ip": "3.3.3.3", "country": "PE", "city": "Trujillo", "region": "La Libertad"}}
     br = FakeBrowser(geos)
-    res = run(run_geo_test(br, "https://demo.myshopify.com", ["lima", "arequipa", "trujillo"], ProxyConfig.from_env(ENV), dwell_ms=0))
+    res = run(run_geo_test(br, "https://demo.myshopify.com", ["lima", "arequipa", "trujillo"], ProxyConfig.from_dict(ENV), dwell_ms=0))
     assert [r.status for r in res] == ["ok", "ok", "ok"]
     assert len({r.session_id for r in res}) == 3
     assert all(r.navigation_completed and r.analytics_request_observed for r in res)
@@ -101,7 +101,7 @@ def test_three_cities_ok_distinct_sessions_and_observations():
 def test_geo_mismatch_never_visits_store():
     geos = {"lima": {"country": "PE", "city": "Arequipa", "region": "Arequipa"}}
     br = FakeBrowser(geos)
-    [r] = run(run_geo_test(br, "https://demo.myshopify.com", ["lima"], ProxyConfig.from_env(ENV), dwell_ms=0))
+    [r] = run(run_geo_test(br, "https://demo.myshopify.com", ["lima"], ProxyConfig.from_dict(ENV), dwell_ms=0))
     assert r.status == "error" and r.error_code == "geo_mismatch"
     assert br.contexts[0].page.visited == ["https://ipinfo.io/json"]
     assert br.contexts[0].closed
@@ -110,7 +110,7 @@ def test_geo_mismatch_never_visits_store():
 def test_proxy_unreachable_is_explicit_and_no_direct_fallback():
     geos = {"lima": {}}
     br = FakeBrowser(geos, fail_geo=True)
-    [r] = run(run_geo_test(br, "https://demo.myshopify.com", ["lima"], ProxyConfig.from_env(ENV), dwell_ms=0))
+    [r] = run(run_geo_test(br, "https://demo.myshopify.com", ["lima"], ProxyConfig.from_dict(ENV), dwell_ms=0))
     assert r.error_code == "proxy_unreachable" and not r.navigation_completed
     assert len(br.contexts) == 1  # no second (direct) attempt
 
@@ -118,5 +118,22 @@ def test_proxy_unreachable_is_explicit_and_no_direct_fallback():
 def test_not_configured_raises_before_any_browser_use():
     br = FakeBrowser({})
     with pytest.raises(GeoTestError) as e:
-        run(run_geo_test(br, "https://demo.myshopify.com", ["lima"], ProxyConfig.from_env({})))
+        run(run_geo_test(br, "https://demo.myshopify.com", ["lima"], ProxyConfig.from_dict({})))
     assert e.value.code == "proxy_not_configured" and br.contexts == []
+
+
+def test_connection_test_mode_never_visits_store():
+    geos = {"lima": {"ip": "1.1.1.1", "country": "PE", "city": "Lima", "region": "Lima"}}
+    br = FakeBrowser(geos)
+    [r] = run(run_geo_test(br, None, ["lima"], ProxyConfig.from_dict(ENV), dwell_ms=0))
+    assert r.status == "ok" and r.geo_match and not r.navigation_completed
+    assert br.contexts[0].page.visited == ["https://ipinfo.io/json"]
+
+
+def test_visits_carry_demo_utm_and_repeated_cities_get_distinct_sessions():
+    geos = {"lima": {"ip": "1.1.1.1", "country": "PE", "city": "Lima", "region": "Lima"}}
+    br = FakeBrowser(geos)
+    res = run(run_geo_test(br, "https://demo.myshopify.com", ["lima", "lima"], ProxyConfig.from_dict(ENV), dwell_ms=0))
+    assert len({r.session_id for r in res}) == 2
+    assert all("utm_source=codflow_demo" in r.visit_url and "utm_medium=simulated" in r.visit_url for r in res)
+    assert {c.proxy["username"] for c in br.contexts} == {f"u1-geo-pe_lima-s-{r.session_id}" for r in res}

@@ -11,9 +11,9 @@ One browser context per city, each through its OWN sticky proxy session, then:
      and what we CANNOT observe from here (always reported as not verified):
        shopify_session_counted, live_view_location.
 
-No credentials in code: everything comes from environment variables. Provider-agnostic: the
-provider's geo + sticky-session parameters are expressed through templates (see README in
-docstring of ProxyConfig). Nothing here adds browser fingerprint masking.
+No credentials in code: the proxy config arrives per request from CodFlow. Provider-agnostic:
+the provider's geo + sticky-session parameters are expressed through templates (see ProxyConfig).
+Nothing here adds browser fingerprint masking; visits carry utm_source=codflow_demo.
 """
 from __future__ import annotations
 
@@ -47,23 +47,19 @@ class GeoTestError(Exception):
 @dataclass
 class ProxyConfig:
     """
-    Generic sticky-geo proxy configuration, from env (never from the request):
+    Generic sticky-geo proxy configuration, sent by CodFlow per request (stored there with the
+    credentials encrypted; managed from the DemoSales admin page):
 
-      DEMO_PROXY_ENABLED=1
-      DEMO_PROXY_PROVIDER=<free label, e.g. the provider name — informational>
-      DEMO_PROXY_SERVER=http://host:port          (scheme://host:port of the provider gateway)
-      DEMO_PROXY_USERNAME_TEMPLATE=...{geo}...{session}...
-      DEMO_PROXY_PASSWORD_TEMPLATE=...            (optional placeholders too; default: no template)
-      DEMO_PROXY_PASSWORD=...                     (secret; substituted as {password})
-      DEMO_PROXY_USERNAME=...                     (secret base user; substituted as {user})
-      DEMO_PROXY_GEO_MAP={"lima":"<provider geo value>", "arequipa":"...", "trujillo":"..."}
-      DEMO_GEO_CHECK_URL=https://ipinfo.io/json   (JSON with ip/city/region/country)
-      DEMO_GEO_MAX_CONCURRENCY=1
+      server             scheme://host:port of the provider gateway
+      username_template  must contain {geo} and {session}; may use {user}
+      password_template  optional, default "{password}"
+      user, password     provider credentials
+      geo_map            {"lima": "<provider value>", "arequipa": ..., "trujillo": ...}
+      geo_check_url      JSON geo lookup (ip/city/region/country), default https://ipinfo.io/json
 
-    {geo} = the provider-specific value for the city (taken ONLY from DEMO_PROXY_GEO_MAP),
-    {session} = a fresh random id per browser context (sticky session), {user} / {password}.
-    The exact syntax (e.g. which username suffix selects city and sticky session) MUST come from
-    the chosen provider's official documentation — it is not hard-coded here.
+    {geo} = provider-specific value for the city (ONLY from geo_map), {session} = fresh random id
+    per browser context (sticky session). The exact syntax must come from the chosen provider's
+    official documentation — nothing provider-specific is hard-coded here.
     """
     enabled: bool
     provider: str
@@ -77,47 +73,45 @@ class ProxyConfig:
     max_concurrency: int
 
     @classmethod
-    def from_env(cls, env: Optional[dict[str, str]] = None) -> "ProxyConfig":
-        e = env if env is not None else os.environ
-        try:
-            geo_map = json.loads(e.get("DEMO_PROXY_GEO_MAP", "") or "{}")
-            if not isinstance(geo_map, dict):
-                raise ValueError
-        except ValueError:
-            raise GeoTestError("bad_geo_map", "DEMO_PROXY_GEO_MAP non è un JSON oggetto valido")
+    def from_dict(cls, d: dict[str, Any]) -> "ProxyConfig":
+        """Config sent by CodFlow for one request (credentials are stored encrypted in CodFlow
+        and decrypted server-side; they are never logged or echoed back here)."""
+        gm = d.get("geo_map") or {}
+        if not isinstance(gm, dict):
+            raise GeoTestError("bad_geo_map", "geo_map deve essere un oggetto")
         return cls(
-            enabled=e.get("DEMO_PROXY_ENABLED", "") == "1",
-            provider=e.get("DEMO_PROXY_PROVIDER", ""),
-            server=e.get("DEMO_PROXY_SERVER", ""),
-            username_template=e.get("DEMO_PROXY_USERNAME_TEMPLATE", ""),
-            password_template=e.get("DEMO_PROXY_PASSWORD_TEMPLATE", "") or "{password}",
-            user=e.get("DEMO_PROXY_USERNAME", ""),
-            password=e.get("DEMO_PROXY_PASSWORD", ""),
-            geo_map={str(k).lower(): str(v) for k, v in geo_map.items()},
-            geo_check_url=e.get("DEMO_GEO_CHECK_URL", "") or "https://ipinfo.io/json",
-            max_concurrency=max(1, min(3, int(e.get("DEMO_GEO_MAX_CONCURRENCY", "1") or 1))),
+            enabled=True,
+            provider=str(d.get("provider") or ""),
+            server=str(d.get("server") or ""),
+            username_template=str(d.get("username_template") or ""),
+            password_template=str(d.get("password_template") or "") or "{password}",
+            user=str(d.get("user") or ""),
+            password=str(d.get("password") or ""),
+            geo_map={str(k).lower(): str(v) for k, v in gm.items()},
+            geo_check_url=str(d.get("geo_check_url") or "") or "https://ipinfo.io/json",
+            max_concurrency=max(1, min(3, int(d.get("max_concurrency") or 1))),
         )
 
-    def missing(self) -> list[str]:
+    def missing(self, cities: Optional[list[str]] = None) -> list[str]:
         """Env vars still missing for the feature to work (names only, never values)."""
         out = []
         if not self.enabled:
-            out.append("DEMO_PROXY_ENABLED")
+            out.append("enabled")
         if not self.server:
-            out.append("DEMO_PROXY_SERVER")
+            out.append("server")
         if not self.username_template:
-            out.append("DEMO_PROXY_USERNAME_TEMPLATE")
+            out.append("username_template")
         if "{session}" not in (self.username_template + self.password_template):
-            out.append("DEMO_PROXY_USERNAME_TEMPLATE ({session} mancante: niente sessione sticky)")
+            out.append("username_template ({session} mancante: niente sessione sticky)")
         if "{geo}" not in (self.username_template + self.password_template):
-            out.append("DEMO_PROXY_USERNAME_TEMPLATE ({geo} mancante: niente selezione città)")
+            out.append("username_template ({geo} mancante: niente selezione città)")
         if not self.password and "{password}" in self.password_template:
-            out.append("DEMO_PROXY_PASSWORD")
+            out.append("password")
         if "{user}" in self.username_template and not self.user:
-            out.append("DEMO_PROXY_USERNAME")
-        for c in CITIES:
+            out.append("user")
+        for c in (cities or list(CITIES)):
             if c not in self.geo_map:
-                out.append(f"DEMO_PROXY_GEO_MAP[{c}]")
+                out.append(f"geo_map[{c}]")
         return out
 
     def for_city(self, city: str, session_id: str) -> dict[str, str]:
@@ -153,11 +147,21 @@ def location_matches(city: str, detected: dict[str, Any]) -> tuple[bool, list[st
     return (not issues, issues)
 
 
+# Simulated sessions stay distinguishable in the store's own analytics (UTM attribution).
+DEMO_UTM = {"utm_source": "codflow_demo", "utm_medium": "simulated"}
+
+
+def demo_url(store_url: str, city: str) -> str:
+    from urllib.parse import urlencode
+    return f"{store_url.rstrip('/')}/?{urlencode({**DEMO_UTM, 'utm_campaign': 'geo_' + city})}"
+
+
 @dataclass
 class SessionResult:
     city: str
     session_id: str
     label: str = "sessione di test demo (non è un cliente reale)"
+    visit_url: Optional[str] = None
     status: str = "pending"                     # ok | error
     error_code: Optional[str] = None
     error: Optional[str] = None
@@ -177,9 +181,10 @@ class SessionResult:
 _run_lock = asyncio.Lock()
 
 
-async def run_geo_test(browser, store_url: str, cities: list[str], cfg: ProxyConfig, *, dwell_ms: int = 8000, timeout_s: float = 45.0) -> list[SessionResult]:
-    """One session per city. Raises GeoTestError for config problems (nothing visited)."""
-    miss = cfg.missing()
+async def run_geo_test(browser, store_url: Optional[str], cities: list[str], cfg: ProxyConfig, *, dwell_ms: int = 8000, timeout_s: float = 45.0) -> list[SessionResult]:
+    """One session per entry of `cities` (repeats allowed). store_url None = connection test only
+    (egress/geo check, no store visit). Raises GeoTestError for config problems (nothing run)."""
+    miss = cfg.missing(sorted(set(cities)))
     if miss:
         raise GeoTestError("proxy_not_configured", "Proxy non configurato: " + ", ".join(miss))
     for c in cities:
@@ -230,13 +235,18 @@ async def _one_session(browser, store_url: str, city: str, cfg: ProxyConfig, res
             # Strict: never visit from a different location.
             raise GeoTestError("geo_mismatch", "Località del proxy diversa da quella richiesta: " + "; ".join(issues))
 
+        if store_url is None:  # connection test only
+            res.status = "ok"
+            return
+
         # 2) Store visit, recording observable analytics traffic.
         def on_response(resp):
             if _ANALYTICS_RE.search(resp.url):
                 res.analytics_requests.append({"url": resp.url.split("?")[0][:160], "status": resp.status})
 
         page.on("response", on_response)
-        nav = await page.goto(store_url, wait_until="domcontentloaded", timeout=25000)
+        res.visit_url = demo_url(store_url, city)
+        nav = await page.goto(res.visit_url, wait_until="domcontentloaded", timeout=25000)
         res.navigation_status = nav.status if nav else None
         res.navigation_completed = bool(nav and nav.ok)
         await page.wait_for_timeout(dwell_ms)
