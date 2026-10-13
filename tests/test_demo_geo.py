@@ -49,20 +49,26 @@ class FakeResp:
     def ok(self): return 200 <= self.status < 300
 
 
+GEO_HOSTS = ("ipinfo", "geojs", "ipwho")
+
+
 class FakePage:
-    def __init__(self, geo, store_status=200, analytics=True, fail_geo=False):
-        self.geo, self.store_status, self.analytics, self.fail_geo = geo, store_status, analytics, fail_geo
-        self.handlers, self.visited = [], []
+    """script: per-attempt behaviour for this context — dict with keys
+       geo (dict) | fail (str error raised on geo goto) | primary_status (int, e.g. 429)."""
+    def __init__(self, script, store_status=200, analytics=True):
+        self.script, self.store_status, self.analytics = script, store_status, analytics
+        self.handlers, self.visited, self._body = [], [], "{}"
     def on(self, ev, fn): self.handlers.append(fn)
     async def goto(self, url, **kw):
         self.visited.append(url)
-        if "ipinfo" in url:
-            if self.fail_geo: raise RuntimeError("ERR_PROXY_CONNECTION_FAILED")
-            return FakeResp(200)
+        if any(h in url for h in GEO_HOSTS):
+            if self.script.get("fail"): raise RuntimeError(self.script["fail"])
+            if "ipinfo" in url and self.script.get("primary_status"): return FakeResp(self.script["primary_status"])
+            self._body = json.dumps(self.script["geo"]); return FakeResp(200)
         if self.analytics:
             for h in self.handlers: h(FakeResp(200, "https://monorail-edge.shopifysvc.com/v1/produce?x=1"))
         return FakeResp(self.store_status)
-    async def inner_text(self, sel): return json.dumps(self.geo)
+    async def inner_text(self, sel): return self._body
     async def wait_for_timeout(self, ms): return None
 
 
@@ -73,46 +79,71 @@ class FakeContext:
 
 
 class FakeBrowser:
-    def __init__(self, geos, **kw):
-        self.geos, self.kw, self.contexts = geos, kw, []
+    """plans: city -> list of per-attempt scripts (last one repeats)."""
+    def __init__(self, plans, **kw):
+        self.plans, self.kw, self.contexts, self.count = plans, kw, [], {}
     async def new_context(self, **kw):
         user = kw["proxy"]["username"]
-        city = next(c for c in self.geos if c in user)
-        ctx = FakeContext(FakePage(self.geos[city], **self.kw)); ctx.proxy = kw["proxy"]
+        city = next(c for c in self.plans if f"pe_{c}-" in user)
+        i = self.count.get(city, 0); self.count[city] = i + 1
+        plan = self.plans[city]
+        ctx = FakeContext(FakePage(plan[min(i, len(plan) - 1)], **self.kw)); ctx.proxy = kw["proxy"]
         self.contexts.append(ctx); return ctx
+
+
+def store_visits(br): return sum(1 for c in br.contexts for u in c.page.visited if "myshopify" in u)
 
 
 def run(coro): return asyncio.get_event_loop().run_until_complete(coro) if False else asyncio.run(coro)
 
 
+G = {"lima": {"ip": "1.1.1.1", "country": "PE", "city": "Lima", "region": "Lima"},
+     "arequipa": {"ip": "2.2.2.2", "country": "PE", "city": "Arequipa", "region": "Arequipa"},
+     "trujillo": {"ip": "3.3.3.3", "country": "PE", "city": "Trujillo", "region": "La Libertad"},
+     "piura": {"ip": "4.4.4.4", "country": "PE", "city": "Piura", "region": "Piura"}}
+CFG = lambda: ProxyConfig.from_dict(ENV)
+
+
 def test_three_cities_ok_distinct_sessions_and_observations():
-    geos = {"lima": {"ip": "1.1.1.1", "country": "PE", "city": "Lima", "region": "Lima"},
-            "arequipa": {"ip": "2.2.2.2", "country": "PE", "city": "Arequipa", "region": "Arequipa"},
-            "trujillo": {"ip": "3.3.3.3", "country": "PE", "city": "Trujillo", "region": "La Libertad"}}
-    br = FakeBrowser(geos)
-    res = run(run_geo_test(br, "https://demo.myshopify.com", ["lima", "arequipa", "trujillo"], ProxyConfig.from_dict(ENV), dwell_ms=0))
+    br = FakeBrowser({c: [{"geo": G[c]}] for c in ("lima", "arequipa", "trujillo")})
+    res = run(run_geo_test(br, "https://demo.myshopify.com", ["lima", "arequipa", "trujillo"], CFG(), dwell_ms=0))
     assert [r.status for r in res] == ["ok", "ok", "ok"]
     assert len({r.session_id for r in res}) == 3
     assert all(r.navigation_completed and r.analytics_request_observed for r in res)
     assert all(r.shopify_session_counted == "non verificabile dal worker" for r in res)
+    assert all(c.closed for c in br.contexts) and store_visits(br) == 3
+
+
+def test_mismatch_every_attempt_never_visits_store():
+    br = FakeBrowser({"trujillo": [{"geo": G["piura"]}]})
+    [r] = run(run_geo_test(br, "https://demo.myshopify.com", ["trujillo"], CFG(), dwell_ms=0))
+    assert r.status == "error" and r.error_code == "geo_mismatch"
+    assert len(br.contexts) == 3 and store_visits(br) == 0
+    assert len({c.proxy["username"] for c in br.contexts}) == 3  # a NEW sticky session each attempt
+    assert [a["result"] for a in r.attempts] == ["geo_mismatch"] * 3
     assert all(c.closed for c in br.contexts)
 
 
-def test_geo_mismatch_never_visits_store():
-    geos = {"lima": {"country": "PE", "city": "Arequipa", "region": "Arequipa"}}
-    br = FakeBrowser(geos)
-    [r] = run(run_geo_test(br, "https://demo.myshopify.com", ["lima"], ProxyConfig.from_dict(ENV), dwell_ms=0))
-    assert r.status == "error" and r.error_code == "geo_mismatch"
-    assert br.contexts[0].page.visited == ["https://ipinfo.io/json"]
-    assert br.contexts[0].closed
+def test_mismatch_then_match_visits_once_from_verified_session():
+    br = FakeBrowser({"trujillo": [{"geo": G["piura"]}, {"geo": G["trujillo"]}]})
+    [r] = run(run_geo_test(br, "https://demo.myshopify.com", ["trujillo"], CFG(), dwell_ms=0))
+    assert r.status == "ok" and r.geo_match and store_visits(br) == 1
+    assert [a["result"] for a in r.attempts] == ["geo_mismatch", "geo_ok"]
+    assert r.session_id in br.contexts[1].proxy["username"]  # the visit used the verified session
+    assert not any("myshopify" in u for u in br.contexts[0].page.visited)
 
 
-def test_proxy_unreachable_is_explicit_and_no_direct_fallback():
-    geos = {"lima": {}}
-    br = FakeBrowser(geos, fail_geo=True)
-    [r] = run(run_geo_test(br, "https://demo.myshopify.com", ["lima"], ProxyConfig.from_dict(ENV), dwell_ms=0))
+def test_primary_429_uses_fallback_service_same_session():
+    br = FakeBrowser({"lima": [{"geo": G["lima"], "primary_status": 429}]})
+    [r] = run(run_geo_test(br, None, ["lima"], CFG(), dwell_ms=0))
+    assert r.status == "ok" and r.geo_source == "get.geojs.io" and len(br.contexts) == 1
+
+
+def test_proxy_tunnel_failure_retries_then_explicit_error_no_direct_fallback():
+    br = FakeBrowser({"lima": [{"fail": "net::ERR_TUNNEL_CONNECTION_FAILED"}]})
+    [r] = run(run_geo_test(br, "https://demo.myshopify.com", ["lima"], CFG(), dwell_ms=0))
     assert r.error_code == "proxy_unreachable" and not r.navigation_completed
-    assert len(br.contexts) == 1  # no second (direct) attempt
+    assert len(br.contexts) == 3 and all("proxy" in vars(c) for c in br.contexts) and store_visits(br) == 0
 
 
 def test_not_configured_raises_before_any_browser_use():
@@ -123,17 +154,13 @@ def test_not_configured_raises_before_any_browser_use():
 
 
 def test_connection_test_mode_never_visits_store():
-    geos = {"lima": {"ip": "1.1.1.1", "country": "PE", "city": "Lima", "region": "Lima"}}
-    br = FakeBrowser(geos)
-    [r] = run(run_geo_test(br, None, ["lima"], ProxyConfig.from_dict(ENV), dwell_ms=0))
-    assert r.status == "ok" and r.geo_match and not r.navigation_completed
-    assert br.contexts[0].page.visited == ["https://ipinfo.io/json"]
+    br = FakeBrowser({"lima": [{"geo": G["lima"]}]})
+    [r] = run(run_geo_test(br, None, ["lima"], CFG(), dwell_ms=0))
+    assert r.status == "ok" and r.geo_match and not r.navigation_completed and store_visits(br) == 0
 
 
 def test_visits_carry_demo_utm_and_repeated_cities_get_distinct_sessions():
-    geos = {"lima": {"ip": "1.1.1.1", "country": "PE", "city": "Lima", "region": "Lima"}}
-    br = FakeBrowser(geos)
-    res = run(run_geo_test(br, "https://demo.myshopify.com", ["lima", "lima"], ProxyConfig.from_dict(ENV), dwell_ms=0))
+    br = FakeBrowser({"lima": [{"geo": G["lima"]}]})
+    res = run(run_geo_test(br, "https://demo.myshopify.com", ["lima", "lima"], CFG(), dwell_ms=0))
     assert len({r.session_id for r in res}) == 2
     assert all("utm_source=codflow_demo" in r.visit_url and "utm_medium=simulated" in r.visit_url for r in res)
-    assert {c.proxy["username"] for c in br.contexts} == {f"u1-geo-pe_lima-s-{r.session_id}" for r in res}

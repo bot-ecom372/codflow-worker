@@ -172,6 +172,8 @@ class SessionResult:
     navigation_status: Optional[int] = None
     analytics_request_observed: bool = False
     analytics_requests: list[dict[str, Any]] = field(default_factory=list)
+    geo_source: Optional[str] = None              # which geo lookup service answered
+    attempts: list[dict[str, Any]] = field(default_factory=list)  # one entry per proxy session tried
     shopify_session_counted: str = "non verificabile dal worker"
     live_view_location: str = "non verificata"
     started_at: float = field(default_factory=time.time)
@@ -180,8 +182,46 @@ class SessionResult:
 
 _run_lock = asyncio.Lock()
 
+# Robustness (2026-10-13), strictness unchanged:
+#  - up to MAX_ATTEMPTS proxy sessions per city (a NEW sticky session each time) when the
+#    egress check fails or lands in the wrong place — the store is visited at most once, and
+#    only from a session verified in the requested city;
+#  - fallback geo lookup services, used ONLY when the primary one is unavailable (429/5xx/
+#    unreadable) — never to "shop around" for a different answer when it disagrees.
+MAX_ATTEMPTS = 3
+RETRYABLE = {"proxy_unreachable", "geo_check_failed", "geo_check_unreadable", "geo_mismatch"}
+GEO_FALLBACKS = ["https://get.geojs.io/v1/ip/geo.json", "https://ipwho.is/"]
 
-async def run_geo_test(browser, store_url: Optional[str], cities: list[str], cfg: ProxyConfig, *, dwell_ms: int = 8000, timeout_s: float = 45.0) -> list[SessionResult]:
+
+async def _geo_lookup(page, primary: str, city: str) -> tuple[dict[str, Any], str]:
+    """Egress location as seen THROUGH this page's proxy. Raises GeoTestError."""
+    last_status = None
+    for url in [primary] + [u for u in GEO_FALLBACKS if u != primary]:
+        try:
+            r = await page.goto(url, wait_until="domcontentloaded", timeout=10000)
+        except Exception as exc:
+            msg = str(exc)
+            # The proxy itself refused/failed the tunnel → no point asking another service.
+            if "ERR_TUNNEL" in msg or "ERR_PROXY" in msg or "ERR_NO_SUPPORTED_PROXIES" in msg:
+                raise GeoTestError("proxy_unreachable", f"Proxy non raggiungibile per {city}: {msg[:200]}")
+            last_status = "timeout"
+            continue
+        if not r or not r.ok:
+            last_status = r.status if r else "?"
+            continue
+        try:
+            data = json.loads(await page.inner_text("body"))
+        except Exception:
+            last_status = "illeggibile"
+            continue
+        if isinstance(data, dict) and data.get("success") is False:  # ipwho.is error shape
+            last_status = "rifiutata"
+            continue
+        return data, url.split("/")[2]
+    raise GeoTestError("geo_check_failed", f"Verifica IP non disponibile (ultimo esito: {last_status})")
+
+
+async def run_geo_test(browser, store_url: Optional[str], cities: list[str], cfg: ProxyConfig, *, dwell_ms: int = 8000, timeout_s: float = 90.0) -> list[SessionResult]:
     """One session per entry of `cities` (repeats allowed). store_url None = connection test only
     (egress/geo check, no store visit). Raises GeoTestError for config problems (nothing run)."""
     miss = cfg.missing(sorted(set(cities)))
@@ -197,7 +237,7 @@ async def run_geo_test(browser, store_url: Optional[str], cities: list[str], cfg
 
         async def one(city: str) -> SessionResult:
             async with sem:
-                res = SessionResult(city=city, session_id=new_session_id())
+                res = SessionResult(city=city, session_id="")
                 try:
                     await asyncio.wait_for(_one_session(browser, store_url, city, cfg, res, dwell_ms), timeout=timeout_s)
                 except asyncio.TimeoutError:
@@ -212,50 +252,53 @@ async def run_geo_test(browser, store_url: Optional[str], cities: list[str], cfg
         return list(await asyncio.gather(*(one(c) for c in cities)))
 
 
-async def _one_session(browser, store_url: str, city: str, cfg: ProxyConfig, res: SessionResult, dwell_ms: int) -> None:
-    proxy = cfg.for_city(city, res.session_id)
-    context = await browser.new_context(proxy=proxy, locale="es-PE", timezone_id="America/Lima")
-    try:
-        page = await context.new_page()
-        # 1) Egress check through THIS context (same proxy session as the visit).
+async def _one_session(browser, store_url: Optional[str], city: str, cfg: ProxyConfig, res: SessionResult, dwell_ms: int) -> None:
+    for n in range(1, MAX_ATTEMPTS + 1):
+        sid = new_session_id()
+        res.session_id = sid
+        context = await browser.new_context(proxy=cfg.for_city(city, sid), locale="es-PE", timezone_id="America/Lima")
         try:
-            r = await page.goto(cfg.geo_check_url, wait_until="domcontentloaded", timeout=20000)
-        except Exception as exc:
-            raise GeoTestError("proxy_unreachable", f"Proxy non raggiungibile per {city}: {str(exc)[:200]}")
-        if not r or not r.ok:
-            raise GeoTestError("geo_check_failed", f"Verifica IP fallita (HTTP {r.status if r else '?'})")
-        try:
-            detected = json.loads(await page.inner_text("body"))
-        except Exception:
-            raise GeoTestError("geo_check_unreadable", "Risposta della verifica IP non leggibile")
-        res.egress = {k: detected.get(k) for k in ("ip", "city", "region", "regionName", "country", "country_code", "org") if detected.get(k) is not None}
-        ok, issues = location_matches(city, detected)
-        res.geo_match, res.discrepancies = ok, issues
-        if not ok:
-            # Strict: never visit from a different location.
-            raise GeoTestError("geo_mismatch", "Località del proxy diversa da quella richiesta: " + "; ".join(issues))
+            page = await context.new_page()
+            try:
+                # 1) Egress check through THIS context (same proxy session as the visit).
+                detected, source = await _geo_lookup(page, cfg.geo_check_url, city)
+                res.geo_source = source
+                res.egress = {k: detected.get(k) for k in ("ip", "city", "region", "regionName", "country", "country_code", "org") if detected.get(k) is not None}
+                ok, issues = location_matches(city, detected)
+                res.geo_match, res.discrepancies = ok, issues
+                if not ok:
+                    # Strict: never visit from a different location.
+                    raise GeoTestError("geo_mismatch", "Località del proxy diversa da quella richiesta: " + "; ".join(issues))
+            except GeoTestError as ge:
+                res.attempts.append({"attempt": n, "session_id": sid, "result": ge.code, "detected": (res.egress or {}).get("city") if ge.code == "geo_mismatch" else None})
+                if ge.code in RETRYABLE and n < MAX_ATTEMPTS:
+                    res.egress = None if ge.code != "geo_mismatch" else res.egress
+                    continue
+                raise
+            res.attempts.append({"attempt": n, "session_id": sid, "result": "geo_ok", "detected": (res.egress or {}).get("city")})
 
-        if store_url is None:  # connection test only
-            res.status = "ok"
+            if store_url is None:  # connection test only
+                res.status = "ok"
+                return
+
+            # 2) Store visit (once), recording observable analytics traffic.
+            def on_response(resp):
+                if _ANALYTICS_RE.search(resp.url):
+                    res.analytics_requests.append({"url": resp.url.split("?")[0][:160], "status": resp.status})
+
+            page.on("response", on_response)
+            res.visit_url = demo_url(store_url, city)
+            nav = await page.goto(res.visit_url, wait_until="domcontentloaded", timeout=25000)
+            res.navigation_status = nav.status if nav else None
+            res.navigation_completed = bool(nav and nav.ok)
+            await page.wait_for_timeout(dwell_ms)
+            res.analytics_request_observed = any(200 <= a["status"] < 300 for a in res.analytics_requests)
+            res.status = "ok" if res.navigation_completed else "error"
+            if not res.navigation_completed:
+                res.error_code, res.error = "navigation_failed", f"Store HTTP {res.navigation_status}"
             return
-
-        # 2) Store visit, recording observable analytics traffic.
-        def on_response(resp):
-            if _ANALYTICS_RE.search(resp.url):
-                res.analytics_requests.append({"url": resp.url.split("?")[0][:160], "status": resp.status})
-
-        page.on("response", on_response)
-        res.visit_url = demo_url(store_url, city)
-        nav = await page.goto(res.visit_url, wait_until="domcontentloaded", timeout=25000)
-        res.navigation_status = nav.status if nav else None
-        res.navigation_completed = bool(nav and nav.ok)
-        await page.wait_for_timeout(dwell_ms)
-        res.analytics_request_observed = any(200 <= a["status"] < 300 for a in res.analytics_requests)
-        res.status = "ok" if res.navigation_completed else "error"
-        if not res.navigation_completed:
-            res.error_code, res.error = "navigation_failed", f"Store HTTP {res.navigation_status}"
-    finally:
-        try:
-            await context.close()
-        except Exception:
-            pass
+        finally:
+            try:
+                await context.close()
+            except Exception:
+                pass
