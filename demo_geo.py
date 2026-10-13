@@ -138,7 +138,11 @@ def location_matches(city: str, detected: dict[str, Any]) -> tuple[bool, list[st
     """Compare requested city with the geo lookup. Returns (ok, discrepancies)."""
     want = CITIES[city]
     issues = []
-    country = str(detected.get("country") or detected.get("country_code") or "").upper()
+    # ISO code first: ipinfo puts "PE" in `country`, geojs/ipwho put "Peru" there and the code in
+    # `country_code` (2026-10-13 bug: a fallback answer "Peru" was taken for a different country).
+    cc = str(detected.get("country_code") or "").strip()
+    c2 = str(detected.get("country") or "").strip()
+    country = (cc if len(cc) == 2 else c2 if len(c2) == 2 else "").upper()
     if country != want["country"]:
         issues.append(f"paese rilevato {country or '?'} ≠ {want['country']}")
     hay = " ".join(str(detected.get(k) or "") for k in ("city", "region", "regionName")).lower()

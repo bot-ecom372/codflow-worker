@@ -164,3 +164,13 @@ def test_visits_carry_demo_utm_and_repeated_cities_get_distinct_sessions():
     res = run(run_geo_test(br, "https://demo.myshopify.com", ["lima", "lima"], CFG(), dwell_ms=0))
     assert len({r.session_id for r in res}) == 2
     assert all("utm_source=codflow_demo" in r.visit_url and "utm_medium=simulated" in r.visit_url for r in res)
+
+
+def test_fallback_service_country_name_is_not_a_mismatch():
+    # geojs / ipwho.is shape: country = full name, country_code = ISO
+    assert location_matches("lima", {"country": "Peru", "country_code": "PE", "city": "Lima", "region": "Lima"})[0]
+    ok, issues = location_matches("lima", {"country": "Chile", "country_code": "CL", "city": "Santiago"})
+    assert not ok
+    br = FakeBrowser({"lima": [{"geo": {"ip": "5.5.5.5", "country": "Peru", "country_code": "PE", "city": "Lima", "region": "Lima"}, "primary_status": 429}]})
+    [r] = run(run_geo_test(br, None, ["lima"], CFG(), dwell_ms=0))
+    assert r.status == "ok" and r.geo_source == "get.geojs.io" and [a["result"] for a in r.attempts] == ["geo_ok"]
