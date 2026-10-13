@@ -70,6 +70,7 @@ class FakePage:
         return FakeResp(self.store_status)
     async def inner_text(self, sel): return self._body
     async def wait_for_timeout(self, ms): return None
+    async def route(self, pattern, handler): self.routed = pattern
 
 
 class FakeContext:

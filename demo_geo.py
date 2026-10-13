@@ -177,6 +177,7 @@ class SessionResult:
     analytics_request_observed: bool = False
     analytics_requests: list[dict[str, Any]] = field(default_factory=list)
     geo_source: Optional[str] = None              # which geo lookup service answered
+    bytes_received: int = 0                       # approx. proxy traffic of the store visit (content-length sum)
     attempts: list[dict[str, Any]] = field(default_factory=list)  # one entry per proxy session tried
     shopify_session_counted: str = "non verificabile dal worker"
     live_view_location: str = "non verificata"
@@ -292,7 +293,23 @@ async def _one_session(launch, store_url: Optional[str], city: str, cfg: ProxyCo
                 return
 
             # 2) Store visit (once), recording observable analytics traffic.
+            # Bandwidth: images, media and fonts are not downloaded (proxy plans are metered);
+            # documents, scripts, stylesheets and XHR/beacons — incl. Shopify analytics — load normally.
+            async def _skip_heavy(route):
+                try:
+                    if route.request.resource_type in ("image", "media", "font"):
+                        await route.abort()
+                    else:
+                        await route.continue_()
+                except Exception:
+                    pass
+            await page.route("**/*", _skip_heavy)
+
             def on_response(resp):
+                try:
+                    res.bytes_received += int(resp.headers.get("content-length") or 0)
+                except Exception:
+                    pass
                 if _ANALYTICS_RE.search(resp.url):
                     res.analytics_requests.append({"url": resp.url.split("?")[0][:160], "status": resp.status})
 
