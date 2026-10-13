@@ -81,8 +81,18 @@ class FakeContext:
 class FakeBrowser:
     """plans: city -> list of per-attempt scripts (last one repeats)."""
     def __init__(self, plans, **kw):
-        self.plans, self.kw, self.contexts, self.count = plans, kw, [], {}
-    async def new_context(self, **kw):
+        self.plans, self.kw, self.contexts, self.count, self.closed_browsers = plans, kw, [], {}, 0
+    async def launch(self, proxy):
+        # browser-level proxy: every context of this browser uses it
+        b = self
+        class _B:
+            async def new_context(_s, **kw):
+                assert "proxy" not in kw  # no per-context proxy any more
+                return await b._ctx(proxy)
+            async def close(_s): b.closed_browsers += 1
+        return _B()
+    async def _ctx(self, proxy):
+        kw = {"proxy": proxy}
         user = kw["proxy"]["username"]
         city = next(c for c in self.plans if f"pe_{c}-" in user)
         i = self.count.get(city, 0); self.count[city] = i + 1
@@ -106,17 +116,18 @@ CFG = lambda: ProxyConfig.from_dict(ENV)
 
 def test_three_cities_ok_distinct_sessions_and_observations():
     br = FakeBrowser({c: [{"geo": G[c]}] for c in ("lima", "arequipa", "trujillo")})
-    res = run(run_geo_test(br, "https://demo.myshopify.com", ["lima", "arequipa", "trujillo"], CFG(), dwell_ms=0))
+    res = run(run_geo_test(br.launch, "https://demo.myshopify.com", ["lima", "arequipa", "trujillo"], CFG(), dwell_ms=0))
     assert [r.status for r in res] == ["ok", "ok", "ok"]
     assert len({r.session_id for r in res}) == 3
     assert all(r.navigation_completed and r.analytics_request_observed for r in res)
     assert all(r.shopify_session_counted == "non verificabile dal worker" for r in res)
     assert all(c.closed for c in br.contexts) and store_visits(br) == 3
+    assert br.closed_browsers == 3  # one browser per session, each closed
 
 
 def test_mismatch_every_attempt_never_visits_store():
     br = FakeBrowser({"trujillo": [{"geo": G["piura"]}]})
-    [r] = run(run_geo_test(br, "https://demo.myshopify.com", ["trujillo"], CFG(), dwell_ms=0))
+    [r] = run(run_geo_test(br.launch, "https://demo.myshopify.com", ["trujillo"], CFG(), dwell_ms=0))
     assert r.status == "error" and r.error_code == "geo_mismatch"
     assert len(br.contexts) == 3 and store_visits(br) == 0
     assert len({c.proxy["username"] for c in br.contexts}) == 3  # a NEW sticky session each attempt
@@ -126,7 +137,7 @@ def test_mismatch_every_attempt_never_visits_store():
 
 def test_mismatch_then_match_visits_once_from_verified_session():
     br = FakeBrowser({"trujillo": [{"geo": G["piura"]}, {"geo": G["trujillo"]}]})
-    [r] = run(run_geo_test(br, "https://demo.myshopify.com", ["trujillo"], CFG(), dwell_ms=0))
+    [r] = run(run_geo_test(br.launch, "https://demo.myshopify.com", ["trujillo"], CFG(), dwell_ms=0))
     assert r.status == "ok" and r.geo_match and store_visits(br) == 1
     assert [a["result"] for a in r.attempts] == ["geo_mismatch", "geo_ok"]
     assert r.session_id in br.contexts[1].proxy["username"]  # the visit used the verified session
@@ -135,13 +146,13 @@ def test_mismatch_then_match_visits_once_from_verified_session():
 
 def test_primary_429_uses_fallback_service_same_session():
     br = FakeBrowser({"lima": [{"geo": G["lima"], "primary_status": 429}]})
-    [r] = run(run_geo_test(br, None, ["lima"], CFG(), dwell_ms=0))
+    [r] = run(run_geo_test(br.launch, None, ["lima"], CFG(), dwell_ms=0))
     assert r.status == "ok" and r.geo_source == "get.geojs.io" and len(br.contexts) == 1
 
 
 def test_proxy_tunnel_failure_retries_then_explicit_error_no_direct_fallback():
     br = FakeBrowser({"lima": [{"fail": "net::ERR_TUNNEL_CONNECTION_FAILED"}]})
-    [r] = run(run_geo_test(br, "https://demo.myshopify.com", ["lima"], CFG(), dwell_ms=0))
+    [r] = run(run_geo_test(br.launch, "https://demo.myshopify.com", ["lima"], CFG(), dwell_ms=0))
     assert r.error_code == "proxy_unreachable" and not r.navigation_completed
     assert len(br.contexts) == 3 and all("proxy" in vars(c) for c in br.contexts) and store_visits(br) == 0
 
@@ -149,19 +160,19 @@ def test_proxy_tunnel_failure_retries_then_explicit_error_no_direct_fallback():
 def test_not_configured_raises_before_any_browser_use():
     br = FakeBrowser({})
     with pytest.raises(GeoTestError) as e:
-        run(run_geo_test(br, "https://demo.myshopify.com", ["lima"], ProxyConfig.from_dict({})))
+        run(run_geo_test(br.launch, "https://demo.myshopify.com", ["lima"], ProxyConfig.from_dict({})))
     assert e.value.code == "proxy_not_configured" and br.contexts == []
 
 
 def test_connection_test_mode_never_visits_store():
     br = FakeBrowser({"lima": [{"geo": G["lima"]}]})
-    [r] = run(run_geo_test(br, None, ["lima"], CFG(), dwell_ms=0))
+    [r] = run(run_geo_test(br.launch, None, ["lima"], CFG(), dwell_ms=0))
     assert r.status == "ok" and r.geo_match and not r.navigation_completed and store_visits(br) == 0
 
 
 def test_visits_carry_demo_utm_and_repeated_cities_get_distinct_sessions():
     br = FakeBrowser({"lima": [{"geo": G["lima"]}]})
-    res = run(run_geo_test(br, "https://demo.myshopify.com", ["lima", "lima"], CFG(), dwell_ms=0))
+    res = run(run_geo_test(br.launch, "https://demo.myshopify.com", ["lima", "lima"], CFG(), dwell_ms=0))
     assert len({r.session_id for r in res}) == 2
     assert all("utm_source=codflow_demo" in r.visit_url and "utm_medium=simulated" in r.visit_url for r in res)
 
@@ -172,5 +183,5 @@ def test_fallback_service_country_name_is_not_a_mismatch():
     ok, issues = location_matches("lima", {"country": "Chile", "country_code": "CL", "city": "Santiago"})
     assert not ok
     br = FakeBrowser({"lima": [{"geo": {"ip": "5.5.5.5", "country": "Peru", "country_code": "PE", "city": "Lima", "region": "Lima"}, "primary_status": 429}]})
-    [r] = run(run_geo_test(br, None, ["lima"], CFG(), dwell_ms=0))
+    [r] = run(run_geo_test(br.launch, None, ["lima"], CFG(), dwell_ms=0))
     assert r.status == "ok" and r.geo_source == "get.geojs.io" and [a["result"] for a in r.attempts] == ["geo_ok"]

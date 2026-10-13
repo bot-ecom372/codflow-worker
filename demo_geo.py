@@ -225,8 +225,12 @@ async def _geo_lookup(page, primary: str, city: str) -> tuple[dict[str, Any], st
     raise GeoTestError("geo_check_failed", f"Verifica IP non disponibile (ultimo esito: {last_status})")
 
 
-async def run_geo_test(browser, store_url: Optional[str], cities: list[str], cfg: ProxyConfig, *, dwell_ms: int = 8000, timeout_s: float = 90.0) -> list[SessionResult]:
-    """One session per entry of `cities` (repeats allowed). store_url None = connection test only
+async def run_geo_test(launch, store_url: Optional[str], cities: list[str], cfg: ProxyConfig, *, dwell_ms: int = 8000, timeout_s: float = 90.0) -> list[SessionResult]:
+    """`launch(proxy)` must return a NEW browser whose WHOLE traffic goes through `proxy`
+    (browser-level proxy): a per-context proxy does not cover Shopify's background analytics
+    (workers), which then left directly from the server — seen 2026-10-13 as sessions from
+    Council Bluffs (US) instead of Peru. One browser per session, closed afterwards.
+    One session per entry of `cities` (repeats allowed). store_url None = connection test only
     (egress/geo check, no store visit). Raises GeoTestError for config problems (nothing run)."""
     miss = cfg.missing(sorted(set(cities)))
     if miss:
@@ -243,7 +247,7 @@ async def run_geo_test(browser, store_url: Optional[str], cities: list[str], cfg
             async with sem:
                 res = SessionResult(city=city, session_id="")
                 try:
-                    await asyncio.wait_for(_one_session(browser, store_url, city, cfg, res, dwell_ms), timeout=timeout_s)
+                    await asyncio.wait_for(_one_session(launch, store_url, city, cfg, res, dwell_ms), timeout=timeout_s)
                 except asyncio.TimeoutError:
                     res.status, res.error_code, res.error = "error", "timeout", f"Sessione oltre {int(timeout_s)}s"
                 except GeoTestError as ge:
@@ -256,12 +260,14 @@ async def run_geo_test(browser, store_url: Optional[str], cities: list[str], cfg
         return list(await asyncio.gather(*(one(c) for c in cities)))
 
 
-async def _one_session(browser, store_url: Optional[str], city: str, cfg: ProxyConfig, res: SessionResult, dwell_ms: int) -> None:
+async def _one_session(launch, store_url: Optional[str], city: str, cfg: ProxyConfig, res: SessionResult, dwell_ms: int) -> None:
     for n in range(1, MAX_ATTEMPTS + 1):
         sid = new_session_id()
         res.session_id = sid
-        context = await browser.new_context(proxy=cfg.for_city(city, sid), locale="es-PE", timezone_id="America/Lima")
+        browser = await launch(cfg.for_city(city, sid))
+        context = None
         try:
+            context = await browser.new_context(locale="es-PE", timezone_id="America/Lima")
             page = await context.new_page()
             try:
                 # 1) Egress check through THIS context (same proxy session as the visit).
@@ -302,7 +308,9 @@ async def _one_session(browser, store_url: Optional[str], city: str, cfg: ProxyC
                 res.error_code, res.error = "navigation_failed", f"Store HTTP {res.navigation_status}"
             return
         finally:
-            try:
-                await context.close()
-            except Exception:
-                pass
+            for closer in (context, browser):
+                try:
+                    if closer is not None:
+                        await closer.close()
+                except Exception:
+                    pass

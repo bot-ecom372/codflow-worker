@@ -702,14 +702,13 @@ def _verify_geo_secret(secret: str):
         raise HTTPException(status_code=401, detail="Invalid secret")
 
 
-async def _geo_browser_get():
-    global _geo_browser, _geo_playwright
-    if not _geo_browser or not _geo_browser.is_connected():
-        from playwright.async_api import async_playwright
-        _geo_playwright = _geo_playwright or await async_playwright().start()
-        # Plain headless Chromium: no automation-hiding flags or scripts.
-        _geo_browser = await _geo_playwright.chromium.launch(headless=True, args=["--no-sandbox", "--disable-dev-shm-usage"])
-    return _geo_browser
+async def _geo_launch(proxy: dict):
+    """A NEW plain headless Chromium with a BROWSER-LEVEL proxy (covers workers too)."""
+    global _geo_playwright
+    from playwright.async_api import async_playwright
+    _geo_playwright = _geo_playwright or await async_playwright().start()
+    # Plain headless Chromium: no automation-hiding flags or scripts.
+    return await _geo_playwright.chromium.launch(headless=True, proxy=proxy, args=["--no-sandbox", "--disable-dev-shm-usage"])
 
 
 def _cities(raw: list[str], cap: int) -> list[str]:
@@ -723,7 +722,7 @@ def _cities(raw: list[str], cap: int) -> list[str]:
 def demo_geo_health(x_worker_secret: str = Header(default="")):
     _verify_geo_secret(x_worker_secret)
     from demo_geo import CITIES
-    return {"ok": True, "cities": list(CITIES), "version": "geo-3"}
+    return {"ok": True, "cities": list(CITIES), "version": "geo-4"}
 
 
 @app.post("/demo/proxy-test")
@@ -733,7 +732,7 @@ async def demo_proxy_test(req: ProxyTestRequest, x_worker_secret: str = Header(d
     from demo_geo import ProxyConfig, GeoTestError, run_geo_test
     try:
         cfg = ProxyConfig.from_dict(req.proxy.model_dump())
-        results = await run_geo_test(await _geo_browser_get(), None, _cities(req.cities, 3), cfg)
+        results = await run_geo_test(_geo_launch, None, _cities(req.cities, 3), cfg)
     except GeoTestError as ge:
         raise HTTPException(status_code=409 if ge.code == "busy" else 412, detail={"code": ge.code, "message": str(ge)})
     return {"success": True, "sessions": [r.__dict__ for r in results]}
@@ -749,7 +748,7 @@ async def demo_geo_sessions(req: GeoSessionsRequest, x_worker_secret: str = Head
         raise HTTPException(status_code=400, detail="store_url deve essere https://dominio senza percorso")
     try:
         cfg = ProxyConfig.from_dict(req.proxy.model_dump())
-        results = await run_geo_test(await _geo_browser_get(), req.store_url.strip().rstrip("/"), _cities(req.cities, 6), cfg,
+        results = await run_geo_test(_geo_launch, req.store_url.strip().rstrip("/"), _cities(req.cities, 6), cfg,
                                      dwell_ms=max(3000, min(20000, req.dwell_ms)))
     except GeoTestError as ge:
         raise HTTPException(status_code=409 if ge.code == "busy" else 412, detail={"code": ge.code, "message": str(ge)})
