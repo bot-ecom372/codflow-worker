@@ -722,7 +722,7 @@ def _cities(raw: list[str], cap: int) -> list[str]:
 def demo_geo_health(x_worker_secret: str = Header(default="")):
     _verify_geo_secret(x_worker_secret)
     from demo_geo import CITIES
-    return {"ok": True, "cities": list(CITIES), "version": "geo-5"}
+    return {"ok": True, "cities": list(CITIES), "version": "geo-6"}
 
 
 @app.post("/demo/proxy-test")
@@ -736,6 +736,31 @@ async def demo_proxy_test(req: ProxyTestRequest, x_worker_secret: str = Header(d
     except GeoTestError as ge:
         raise HTTPException(status_code=409 if ge.code == "busy" else 412, detail={"code": ge.code, "message": str(ge)})
     return {"success": True, "sessions": [r.__dict__ for r in results]}
+
+
+class GeoDiagnoseRequest(BaseModel):
+    proxy: ProxyPayload
+    store_url: str
+    city: str
+    marker: str
+    dwell_ms: int = 15000
+
+
+@app.post("/demo/geo-diagnose")
+async def demo_geo_diagnose(req: GeoDiagnoseRequest, x_worker_secret: str = Header(default="")):
+    """ONE diagnostic visit (all resources, no browser changes) with detailed capture."""
+    _verify_geo_secret(x_worker_secret)
+    from demo_geo import ProxyConfig, GeoTestError, run_diagnostic_visit
+    if not re.match(r"^https://[a-z0-9-]+(\.[a-z0-9-]+)+/?$", req.store_url.strip().lower()):
+        raise HTTPException(status_code=400, detail="store_url deve essere https://dominio senza percorso")
+    if not re.match(r"^[a-z0-9_-]{4,40}$", req.marker):
+        raise HTTPException(status_code=400, detail="marker non valido")
+    try:
+        cfg = ProxyConfig.from_dict(req.proxy.model_dump())
+        res = await run_diagnostic_visit(_geo_launch, req.store_url.strip().rstrip("/"), req.city.strip().lower(), cfg, req.marker, max(5000, min(30000, req.dwell_ms)))
+    except GeoTestError as ge:
+        raise HTTPException(status_code=409 if ge.code == "busy" else 412, detail={"code": ge.code, "message": str(ge)})
+    return {"success": True, "result": res}
 
 
 @app.post("/demo/geo-sessions")

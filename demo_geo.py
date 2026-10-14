@@ -331,3 +331,129 @@ async def _one_session(launch, store_url: Optional[str], city: str, cfg: ProxyCo
                         await closer.close()
                 except Exception:
                     pass
+
+
+# ═══════════════════════════════════════════
+# DIAGNOSTIC VISIT (2026-10-14): ONE visit, all resources loaded, NOTHING changed in the browser
+# (no UA override, no scripts, no consent clicks). Records what is needed to tell "HTTP 200" apart
+# from "a valid analytics event": final URL + redirects, JS errors, Shopify consent API state,
+# tracking cookies, and the event names/consent fields inside the analytics payloads.
+# ═══════════════════════════════════════════
+_CONSENT_JS = """() => {
+  const out = { has_customer_privacy: false };
+  try {
+    const cp = window.Shopify && window.Shopify.customerPrivacy;
+    if (cp) {
+      out.has_customer_privacy = true;
+      const call = (f) => { try { return typeof cp[f] === 'function' ? cp[f]() : null; } catch (e) { return 'err:' + e.message; } };
+      out.analyticsProcessingAllowed = call('analyticsProcessingAllowed');
+      out.marketingAllowed = call('marketingAllowed');
+      out.userCanBeTracked = call('userCanBeTracked');
+      out.shouldShowBanner = call('shouldShowBanner');
+      out.saleOfDataRegion = call('saleOfDataRegion');
+      out.currentVisitorConsent = call('currentVisitorConsent');
+    }
+  } catch (e) { out.error = String(e); }
+  const banner = document.querySelector('#shopify-pc__banner, .shopify-pc__banner__dialog, [id*="cookie" i][role="dialog"]');
+  out.banner_visible = !!(banner && banner.offsetParent !== null);
+  out.user_agent = navigator.userAgent;
+  out.webdriver = navigator.webdriver === true;
+  out.document_url = location.href;
+  return out;
+}"""
+
+
+def _event_names(post: str) -> list[str]:
+    names: list[str] = []
+    try:
+        data = json.loads(post)
+    except Exception:
+        return re.findall(r'"(?:event_name|name|schema_id)"\s*:\s*"([^"]{1,80})"', post or "")[:20]
+    def walk(v, depth=0):
+        if depth > 6 or len(names) >= 30:
+            return
+        if isinstance(v, dict):
+            for k in ("event_name", "schema_id", "name"):
+                if isinstance(v.get(k), str) and len(v[k]) < 80:
+                    names.append(f"{k}={v[k]}")
+            for x in v.values():
+                walk(x, depth + 1)
+        elif isinstance(v, list):
+            for x in v:
+                walk(x, depth + 1)
+    walk(data)
+    return names
+
+
+async def run_diagnostic_visit(launch, store_url: str, city: str, cfg: ProxyConfig, marker: str, dwell_ms: int = 15000) -> dict[str, Any]:
+    from urllib.parse import urlencode
+    if cfg.missing([city]):
+        raise GeoTestError("proxy_not_configured", "Proxy non configurato")
+    if _run_lock.locked():
+        raise GeoTestError("busy", "Un'altra prova è in corso")
+    async with _run_lock:
+        out: dict[str, Any] = {"city": city, "marker": marker, "started_at": time.time()}
+        sid = new_session_id()
+        browser = await launch(cfg.for_city(city, sid))
+        context = None
+        try:
+            context = await browser.new_context(locale="es-PE", timezone_id="America/Lima")
+            page = await context.new_page()
+            detected, source = await _geo_lookup(page, cfg.geo_check_url, city)
+            ok, issues = location_matches(city, detected)
+            out["egress"] = {k: detected.get(k) for k in ("ip", "city", "region", "country", "country_code") if detected.get(k) is not None}
+            out["geo_match"], out["discrepancies"] = ok, issues
+            if not ok:
+                out["status"] = "geo_mismatch"
+                return out
+            js_errors: list[str] = []
+            console_errors: list[str] = []
+            analytics: list[dict[str, Any]] = []
+            failed: list[str] = []
+            page.on("pageerror", lambda e: js_errors.append(str(e)[:200]))
+            page.on("console", lambda m: console_errors.append(m.text[:200]) if m.type == "error" else None)
+            page.on("requestfailed", lambda r: failed.append(f"{r.url.split('?')[0][:120]} {r.failure}"))
+
+            async def on_response(resp):
+                if not _ANALYTICS_RE.search(resp.url):
+                    return
+                req = resp.request
+                post = ""
+                try:
+                    post = req.post_data or ""
+                except Exception:
+                    pass
+                analytics.append({"url": resp.url.split("?")[0][:140], "method": req.method, "status": resp.status,
+                                  "events": _event_names(post),
+                                  "consent_fields": sorted(set(re.findall(r'"((?:analytics|marketing|preferences|sale_of_data|consent)[a-zA-Z_]*)"\s*:\s*("?[a-zA-Z0-9_]+"?)', post)))[:12]})
+            page.on("response", on_response)
+
+            url = f"{store_url.rstrip('/')}/?{urlencode({'utm_source': 'codflow_demo', 'utm_medium': 'simulated', 'utm_campaign': 'diag_' + marker})}"
+            out["visit_url"] = url
+            nav = await page.goto(url, wait_until="load", timeout=45000)
+            chain = []
+            r = nav.request if nav else None
+            while r is not None:
+                chain.append(r.url.split("?")[0][:140])
+                r = r.redirected_from
+            out["redirect_chain"] = list(reversed(chain))
+            out["navigation_status"] = nav.status if nav else None
+            await page.wait_for_timeout(dwell_ms)
+            out["final_url"] = page.url[:200]
+            out["consent"] = await page.evaluate(_CONSENT_JS)
+            cookies = await context.cookies()
+            out["cookies"] = sorted({c["name"] for c in cookies if c["name"].startswith(("_shopify", "_tracking", "_landing", "_orig", "_y", "_s", "cart"))})
+            out["js_errors"] = js_errors[:10]
+            out["console_errors"] = console_errors[:10]
+            out["failed_requests"] = failed[:10]
+            out["analytics"] = analytics[:25]
+            out["status"] = "done"
+            return out
+        finally:
+            for closer in (context, browser):
+                try:
+                    if closer is not None:
+                        await closer.close()
+                except Exception:
+                    pass
+            out["duration_ms"] = int((time.time() - out["started_at"]) * 1000)
