@@ -442,6 +442,21 @@ async def run_diagnostic_visit(launch, store_url: str, city: str, cfg: ProxyConf
             out["final_url"] = page.url[:200]
             out["consent"] = await page.evaluate(_CONSENT_JS)
             cookies = await context.cookies()
+            # Let analytics finish BEFORE closing (2026-10-14: closing right away aborted the
+            # unload/batched beacons -> ERR_ABORTED). Wait for network idle, leave the page the
+            # normal way (unload beacons fire), then give pending requests time to complete.
+            try:
+                await page.wait_for_load_state("networkidle", timeout=10000)
+            except Exception:
+                pass
+            aborted_before_leave = sum(1 for f in failed if "ERR_ABORTED" in f)
+            try:
+                await page.goto("about:blank", wait_until="load", timeout=10000)
+            except Exception:
+                pass
+            await page.wait_for_timeout(5000)
+            out["aborted_before_leave"] = aborted_before_leave
+            out["aborted_total"] = sum(1 for f in failed if "ERR_ABORTED" in f)
             out["cookies"] = sorted({c["name"] for c in cookies if c["name"].startswith(("_shopify", "_tracking", "_landing", "_orig", "_y", "_s", "cart"))})
             out["js_errors"] = js_errors[:10]
             out["console_errors"] = console_errors[:10]

@@ -722,7 +722,7 @@ def _cities(raw: list[str], cap: int) -> list[str]:
 def demo_geo_health(x_worker_secret: str = Header(default="")):
     _verify_geo_secret(x_worker_secret)
     from demo_geo import CITIES
-    return {"ok": True, "cities": list(CITIES), "version": "geo-6"}
+    return {"ok": True, "cities": list(CITIES), "version": "geo-7"}
 
 
 @app.post("/demo/proxy-test")
