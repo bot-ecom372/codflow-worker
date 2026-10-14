@@ -718,11 +718,69 @@ def _cities(raw: list[str], cap: int) -> list[str]:
     return out
 
 
+class GeoJobRequest(BaseModel):
+    job_id: str
+    proxy: ProxyPayload
+    store_url: str
+    cities: list[str]
+    dwell_ms: int = 6000
+
+
+@app.post("/demo/geo-jobs", status_code=202)
+async def demo_geo_job_start(req: GeoJobRequest, x_worker_secret: str = Header(default="")):
+    """Asynchronous batch of demo visits (see demo_jobs.py). Idempotent on job_id."""
+    _verify_geo_secret(x_worker_secret)
+    import demo_jobs
+    from demo_geo import ProxyConfig, GeoTestError, CITIES
+    if not re.match(r"^[a-f0-9-]{36}$", req.job_id):
+        raise HTTPException(status_code=400, detail="job_id non valido")
+    if not re.match(r"^https://[a-z0-9-]+(\.[a-z0-9-]+)+/?$", req.store_url.strip().lower()):
+        raise HTTPException(status_code=400, detail="store_url deve essere https://dominio senza percorso")
+    cities = [c.strip().lower() for c in req.cities][:20]
+    if not cities or any(c not in CITIES for c in cities):
+        raise HTTPException(status_code=400, detail="città non valide")
+    try:
+        cfg = ProxyConfig.from_dict(req.proxy.model_dump())
+        miss = cfg.missing(sorted(set(cities)))
+        if miss:
+            raise GeoTestError("proxy_not_configured", ", ".join(miss))
+        job, created = demo_jobs.start_job(req.job_id, cfg, req.store_url.strip().rstrip("/"), cities, max(3000, min(20000, req.dwell_ms)), _geo_launch)
+    except OverflowError:
+        raise HTTPException(status_code=429, detail={"code": "queue_full", "message": "Troppe visite in coda", "queued": demo_jobs.queued_visits()})
+    except GeoTestError as ge:
+        raise HTTPException(status_code=412, detail={"code": ge.code, "message": str(ge)})
+    return {"created": created, "job": demo_jobs.public(job)}
+
+
+@app.get("/demo/geo-jobs/{job_id}")
+def demo_geo_job_status(job_id: str, x_worker_secret: str = Header(default="")):
+    _verify_geo_secret(x_worker_secret)
+    import demo_jobs
+    job = demo_jobs.JOBS.get(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="job sconosciuto")
+    return {"job": demo_jobs.public(job)}
+
+
+class GeoJobCancel(BaseModel):
+    job_id: Optional[str] = None
+
+
+@app.post("/demo/geo-jobs/cancel")
+def demo_geo_job_cancel(req: GeoJobCancel, x_worker_secret: str = Header(default="")):
+    """Stop: one job (job_id) or ALL jobs (no job_id). Visits not started are dropped."""
+    _verify_geo_secret(x_worker_secret)
+    import demo_jobs
+    return {"cancelled_jobs": demo_jobs.cancel(req.job_id)}
+
+
 @app.get("/demo/geo/health")
 def demo_geo_health(x_worker_secret: str = Header(default="")):
     _verify_geo_secret(x_worker_secret)
     from demo_geo import CITIES
-    return {"ok": True, "cities": list(CITIES), "version": "geo-8"}
+    import demo_jobs
+    return {"ok": True, "cities": list(CITIES), "version": "geo-9", "max_browsers": demo_jobs.MAX_BROWSERS,
+            "queued_visits": demo_jobs.queued_visits(), "max_queued": demo_jobs.MAX_QUEUED}
 
 
 @app.post("/demo/proxy-test")
