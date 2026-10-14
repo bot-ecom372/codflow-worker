@@ -722,7 +722,7 @@ def _cities(raw: list[str], cap: int) -> list[str]:
 def demo_geo_health(x_worker_secret: str = Header(default="")):
     _verify_geo_secret(x_worker_secret)
     from demo_geo import CITIES
-    return {"ok": True, "cities": list(CITIES), "version": "geo-7"}
+    return {"ok": True, "cities": list(CITIES), "version": "geo-8"}
 
 
 @app.post("/demo/proxy-test")
@@ -760,7 +760,23 @@ async def demo_geo_diagnose(req: GeoDiagnoseRequest, x_worker_secret: str = Head
         res = await run_diagnostic_visit(_geo_launch, req.store_url.strip().rstrip("/"), req.city.strip().lower(), cfg, req.marker, max(5000, min(30000, req.dwell_ms)))
     except GeoTestError as ge:
         raise HTTPException(status_code=409 if ge.code == "busy" else 412, detail={"code": ge.code, "message": str(ge)})
+    # Keep the result so it can be re-read if the HTTP response is lost (2026-10-14: a response
+    # completed server-side never reached the caller). In memory, last 20 markers.
+    _DIAG_RESULTS[req.marker] = res
+    while len(_DIAG_RESULTS) > 20:
+        _DIAG_RESULTS.pop(next(iter(_DIAG_RESULTS)))
     return {"success": True, "result": res}
+
+
+_DIAG_RESULTS: dict = {}
+
+
+@app.get("/demo/geo-diagnose/{marker}")
+def demo_geo_diagnose_result(marker: str, x_worker_secret: str = Header(default="")):
+    _verify_geo_secret(x_worker_secret)
+    if marker not in _DIAG_RESULTS:
+        raise HTTPException(status_code=404, detail="nessun risultato per questo marcatore")
+    return {"success": True, "result": _DIAG_RESULTS[marker]}
 
 
 @app.post("/demo/geo-sessions")
