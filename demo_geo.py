@@ -156,8 +156,11 @@ DEMO_UTM = {"utm_source": "codflow_demo", "utm_medium": "simulated"}
 
 
 def demo_url(store_url: str, city: str) -> str:
-    from urllib.parse import urlencode
-    return f"{store_url.rstrip('/')}/?{urlencode({**DEMO_UTM, 'utm_campaign': 'geo_' + city})}"
+    from urllib.parse import urlencode, urlparse
+    base = store_url.rstrip('/')
+    q = urlencode({**DEMO_UTM, 'utm_campaign': 'geo_' + city})
+    # With a page path (https://shop/pages/product) the query goes right after it; home keeps "/?".
+    return f"{base}?{q}" if urlparse(base).path not in ("", "/") else f"{base}/?{q}"
 
 
 @dataclass

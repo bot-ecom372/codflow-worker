@@ -186,3 +186,11 @@ def test_fallback_service_country_name_is_not_a_mismatch():
     br = FakeBrowser({"lima": [{"geo": {"ip": "5.5.5.5", "country": "Peru", "country_code": "PE", "city": "Lima", "region": "Lima"}, "primary_status": 429}]})
     [r] = run(run_geo_test(br.launch, None, ["lima"], CFG(), dwell_ms=0))
     assert r.status == "ok" and r.geo_source == "get.geojs.io" and [a["result"] for a in r.attempts] == ["geo_ok"]
+
+
+
+def test_demo_url_with_page_path():
+    from demo_geo import demo_url
+    assert demo_url("https://shop.myshopify.com", "lima").startswith("https://shop.myshopify.com/?utm_")
+    u = demo_url("https://shop.myshopify.com/pages/product", "lima")
+    assert u.startswith("https://shop.myshopify.com/pages/product?utm_") and "geo_lima" in u

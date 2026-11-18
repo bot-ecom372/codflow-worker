@@ -686,6 +686,12 @@ class ProxyTestRequest(BaseModel):
     proxy: ProxyPayload
     cities: list[str]
 
+# Store URL for demo visits: https://domain, optionally with a store path (e.g. /pages/product)
+# so the visit opens one light page instead of the home (2026-11-18). No query, no fragment.
+def _store_url_ok(url: str) -> bool:
+    return bool(re.match(r"^https://[a-z0-9-]+(\.[a-z0-9-]+)+(/[A-Za-z0-9/_.-]*)?$", (url or "").strip()))
+
+
 class GeoSessionsRequest(BaseModel):
     proxy: ProxyPayload
     store_url: str
@@ -734,8 +740,8 @@ async def demo_geo_job_start(req: GeoJobRequest, x_worker_secret: str = Header(d
     from demo_geo import ProxyConfig, GeoTestError, CITIES
     if not re.match(r"^[a-f0-9-]{36}$", req.job_id):
         raise HTTPException(status_code=400, detail="job_id non valido")
-    if not re.match(r"^https://[a-z0-9-]+(\.[a-z0-9-]+)+/?$", req.store_url.strip().lower()):
-        raise HTTPException(status_code=400, detail="store_url deve essere https://dominio senza percorso")
+    if not _store_url_ok(req.store_url):
+        raise HTTPException(status_code=400, detail="store_url deve essere https://dominio con eventuale percorso (es. /pages/product)")
     cities = [c.strip().lower() for c in req.cities][:20]
     if not cities or any(c not in CITIES for c in cities):
         raise HTTPException(status_code=400, detail="città non valide")
@@ -779,7 +785,7 @@ def demo_geo_health(x_worker_secret: str = Header(default="")):
     _verify_geo_secret(x_worker_secret)
     from demo_geo import CITIES
     import demo_jobs
-    return {"ok": True, "cities": list(CITIES), "version": "geo-9", "max_browsers": demo_jobs.MAX_BROWSERS,
+    return {"ok": True, "cities": list(CITIES), "version": "geo-10", "max_browsers": demo_jobs.MAX_BROWSERS,
             "queued_visits": demo_jobs.queued_visits(), "max_queued": demo_jobs.MAX_QUEUED}
 
 
@@ -809,8 +815,8 @@ async def demo_geo_diagnose(req: GeoDiagnoseRequest, x_worker_secret: str = Head
     """ONE diagnostic visit (all resources, no browser changes) with detailed capture."""
     _verify_geo_secret(x_worker_secret)
     from demo_geo import ProxyConfig, GeoTestError, run_diagnostic_visit
-    if not re.match(r"^https://[a-z0-9-]+(\.[a-z0-9-]+)+/?$", req.store_url.strip().lower()):
-        raise HTTPException(status_code=400, detail="store_url deve essere https://dominio senza percorso")
+    if not _store_url_ok(req.store_url):
+        raise HTTPException(status_code=400, detail="store_url deve essere https://dominio con eventuale percorso (es. /pages/product)")
     if not re.match(r"^[a-z0-9_-]{4,40}$", req.marker):
         raise HTTPException(status_code=400, detail="marker non valido")
     try:
@@ -843,8 +849,8 @@ async def demo_geo_sessions(req: GeoSessionsRequest, x_worker_secret: str = Head
     whose proxy fails or is in the wrong place never visits the store (no direct fallback)."""
     _verify_geo_secret(x_worker_secret)
     from demo_geo import ProxyConfig, GeoTestError, run_geo_test
-    if not re.match(r"^https://[a-z0-9-]+(\.[a-z0-9-]+)+/?$", req.store_url.strip().lower()):
-        raise HTTPException(status_code=400, detail="store_url deve essere https://dominio senza percorso")
+    if not _store_url_ok(req.store_url):
+        raise HTTPException(status_code=400, detail="store_url deve essere https://dominio con eventuale percorso (es. /pages/product)")
     try:
         cfg = ProxyConfig.from_dict(req.proxy.model_dump())
         results = await run_geo_test(_geo_launch, req.store_url.strip().rstrip("/"), _cities(req.cities, 6), cfg,
